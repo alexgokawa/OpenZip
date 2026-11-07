@@ -1,0 +1,222 @@
+:root {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  color-scheme: light;
+
+  /* ----------------------------- Light palette ----------------------------- */
+  --bg-app: #f0f0f0;
+  --bg-title: linear-gradient(180deg, #fbfbfc 0%, #eef0f3 100%);
+  --bg-toolbar: linear-gradient(180deg, #f7f8fa 0%, #e9ebef 100%);
+  --bg-header: linear-gradient(180deg, #f1f3f6 0%, #e5e8ed 100%);
+  --bg-status: linear-gradient(180deg, #f3f4f6 0%, #e6e9ed 100%);
+  --bg-panel: #f0f0f0;
+  --bg-panel-2: #e9e9e9;
+  --bg-surface: #ffffff;
+  --bg-input: #ffffff;
+  --bg-hover: #e2e8f1;
+  --bg-active: #d3dce9;
+  --bg-crumb-hover: #e1e6ee;
+  --bg-row-hover: #f2f7fd;
+  --bg-row-selected: #cfe2fb;
+  --bg-row-selected-hover: #c4dbf7;
+  --bg-code: #eef1f5;
+  --bg-action: linear-gradient(180deg, #ffffff 0%, #eceff4 100%);
+  --bg-action-hover: linear-gradient(180deg, #ffffff 0%, #e2e9f2 100%);
+  --bg-banner: #fff5e0;
+  --bg-error: linear-gradient(180deg, #fdf1f0 0%, #f8e2e0 100%);
+  --bg-progress-track: #f7f8fa;
+  --bg-scroll-track: #f4f5f7;
+  --bg-scroll-thumb: #cdd2da;
+  --bg-scroll-thumb-hover: #b4bbc6;
+  --bg-empty: radial-gradient(circle at 50% 32%, rgba(47, 111, 181, 0.06), transparent 62%), #ffffff;
+  --pill-bg: #e6f0fb;
+  --pill-scs-bg: #fdf2e2;
+
+  --line: #dcdcdc;
+  --line-soft: #e4e4e4;
+  --line-header: #e0e3e8;
+  --line-row: #f0f1f3;
+  --line-selected: #c0d7ee;
+  --line-input: #b9bec7;
+  --line-input-focus: #8fb4dc;
+  --line-action: #b6c1cf;
+  --line-action-hover: #9fb1c6;
+  --line-track: #b7bfc9;
+  --line-banner: #e8c98a;
+  --line-error: #e0b4b0;
+  --line-pill: #b9cfe7;
+  --line-pill-scs: #e3c9a4;
+  --line-hover: #bcc6d4;
+  --line-crumb-hover: #cbd2dc;
+
+  --text: #23262b;
+  --text-soft: #5c636e;
+  --text-dim: #8b929c;
+  --text-disabled: #a3a9b2;
+  --text-title: #1b1e23;
+  --text-primary-btn: #123f6d;
+  --text-input: #1f2329;
+  --text-action: #1f3f63;
+  --text-header: #414852;
+  --text-date: #4f5761;
+  --text-muted-size: #6f7782;
+  --text-selected-note: #4c6b8c;
+  --text-caret: #5a6270;
+  --text-error: #7d1f19;
+  --text-banner: #6b4a08;
+  --text-progress: #3f5873;
+  --text-pill: #27578a;
+  --text-pill-scs: #8a5312;
+  --text-selection: #1a1c20;
+  --text-empty-heading: #3a4048;
+
+  --icon-muted: #7b8492;
+  --icon-folder: #d9a327;
+  --icon-container: #a9661a;
+  --icon-file: #7b8492;
+  --icon-empty: #b8bfc9;
+  --icon-banner: #c07d06;
+
+  --accent: #2f6fb5;
+  --accent-strong: #1f5a9c;
+  --danger: #b3261e;
+  --success: #1d6f42;
+  --gold: #c58a08;
+  --footer-kofi: #b45309;
+  --footer-kofi-hover: #92400e;
+  --footer-github: #1f6feb;
+  --footer-github-hover: #1d4ed8;
+  --select: #cfe2fb;
+  --select-border: #9dbfe6;
+  --progress-fill: linear-gradient(180deg, #79b2ec 0%, #3a7fc2 55%, #2f6fb5 100%);
+  --focus-ring: rgba(47, 111, 181, 0.18);
+  --shadow-btn: rgba(0, 0, 0, 0.06);
+  --banner-code-bg: rgba(0, 0, 0, 0.07);
+
+  color: var(--text);
+  background: var(--bg-app);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* ------------------------------ Dark palette ----------------------------- */
+  --bg-app: #1e1e1e;
+  --bg-title: #252526;
+  --bg-toolbar: #252526;
+  --bg-header: #2d2d2d;
+  --bg-status: #2d2d2d;
+  --bg-panel: #252526;
+  --bg-panel-2: #2d2d2d;
+  --bg-surface: #181818;
+  --bg-input: #1e1e1e;
+  --bg-hover: #2a2d2e;
+  --bg-active: #333333;
+  --bg-crumb-hover: #2a2d2e;
+  --bg-row-hover: #2a2d2e;
+  --bg-row-selected: #094771;
+  --bg-row-selected-hover: #0e5382;
+  --bg-code: #2a2a2a;
+  --bg-action: #333333;
+  --bg-action-hover: #3a3a3a;
+  --bg-banner: #3a2f1a;
+  --bg-error: #3a1f1f;
+  --bg-progress-track: #1e1e1e;
+  --bg-scroll-track: #1e1e1e;
+  --bg-scroll-thumb: #3c3c3c;
+  --bg-scroll-thumb-hover: #4f4f4f;
+  --bg-empty: radial-gradient(circle at 50% 32%, rgba(79, 156, 240, 0.05), transparent 62%), #181818;
+  --pill-bg: #1d3a52;
+  --pill-scs-bg: #3a2a17;
+
+  --line: #383838;
+  --line-soft: #333333;
+  --line-header: #383838;
+  --line-row: #383838;
+  --line-selected: #1177bb;
+  --line-input: #3c3c3c;
+  --line-input-focus: #4f9cf0;
+  --line-action: #4a4a4a;
+  --line-action-hover: #5a5a5a;
+  --line-track: #454545;
+  --line-banner: #5c4a24;
+  --line-error: #6b3a3a;
+  --line-pill: #2d5f8a;
+  --line-pill-scs: #6b4a24;
+  --line-hover: #454545;
+  --line-crumb-hover: #3c3c3c;
+
+  --text: #e0e0e0;
+  --text-soft: #a0a0a0;
+  --text-dim: #8e8e8e;
+  --text-disabled: #6b6b6b;
+  --text-title: #e8e8e8;
+  --text-primary-btn: #cfe8ff;
+  --text-input: #e0e0e0;
+  --text-action: #d6e9ff;
+  --text-header: #cfcfcf;
+  --text-date: #b0b0b0;
+  --text-muted-size: #8e8e8e;
+  --text-selected-note: #9cc7ea;
+  --text-caret: #a0a0a0;
+  --text-error: #f0a8a0;
+  --text-banner: #e8c98a;
+  --text-progress: #9cc7ea;
+  --text-pill: #9cc7ea;
+  --text-pill-scs: #e8c98a;
+  --text-selection: #ffffff;
+  --text-empty-heading: #e0e0e0;
+
+  --icon-muted: #9aa0a6;
+  --icon-folder: #dcb047;
+  --icon-container: #d19a66;
+  --icon-file: #9aa0a6;
+  --icon-empty: #6b6b6b;
+  --icon-banner: #e8b04a;
+
+  --accent: #4f9cf0;
+  --accent-strong: #6fb3ff;
+  --danger: #f48771;
+  --success: #6fbf73;
+  --gold: #e5b53c;
+  --footer-kofi: #f59e0b;
+  --footer-kofi-hover: #fbbf24;
+  --footer-github: #58a6ff;
+  --footer-github-hover: #79c0ff;
+  --select: #094771;
+  --select-border: #1177bb;
+  --progress-fill: linear-gradient(180deg, #5aa7e8 0%, #2f7fc4 55%, #2f6fb5 100%);
+  --focus-ring: rgba(79, 156, 240, 0.25);
+  --shadow-btn: rgba(0, 0, 0, 0.4);
+  --banner-code-bg: rgba(255, 255, 255, 0.08);
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-app);
+  color: var(--text);
+}
+
+#root {
+  height: 100%;
+}
+
+button,
+input {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+::selection {
+  background: var(--select);
+  color: var(--text-selection);
+}
