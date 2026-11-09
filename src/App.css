@@ -75,6 +75,16 @@ body,
   padding-left: 2px;
 }
 
+.brand-version {
+  font-size: 11px;
+  color: var(--text-dim);
+  border: 1px solid var(--line-soft);
+  padding: 2px 6px;
+  border-radius: 999px;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
 .titlebar-right {
   display: flex;
   align-items: center;
@@ -217,6 +227,54 @@ body,
   background: var(--bg-panel-2);
   border-bottom: 1px solid var(--line-soft);
   flex: 0 0 auto;
+  position: relative;
+  z-index: 1100;
+}
+
+.nav-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 7px;
+  border-right: 1px solid var(--line-soft);
+  flex: 0 0 auto;
+}
+
+.nav-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 27px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.nav-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--line-soft);
+}
+
+.nav-btn:active:not(:disabled) {
+  background: var(--bg-active);
+}
+
+.nav-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.nav-btn:disabled {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.nav-btn svg {
+  pointer-events: none;
 }
 
 .address-icon {
@@ -508,6 +566,15 @@ body,
   flex: 0 0 auto;
 }
 
+.row-note.edited {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.row.is-edited .row-name {
+  color: var(--accent);
+}
+
 .row.selected .row-note {
   color: var(--text-selected-note);
 }
@@ -719,6 +786,11 @@ body,
   color: var(--text-dim);
 }
 
+.status-stat.edited {
+  color: var(--gold);
+  font-weight: 600;
+}
+
 /* ------------------------------------------------------------------ */
 /* External link footer                                                */
 /* ------------------------------------------------------------------ */
@@ -910,8 +982,7 @@ body,
   align-items: center;
   gap: 6px;
   height: 27px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
+  padding: 0 10px;  border: 1px solid var(--line);
   border-radius: 4px;
   background: var(--bg-input);
   color: var(--text);
@@ -940,6 +1011,17 @@ body,
 
 .editor-btn.save svg {
   color: var(--gold);
+}
+
+.editor-btn.mod-target {
+  max-width: 170px;
+  color: var(--accent);
+}
+
+.editor-btn.mod-target span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .editor-body {

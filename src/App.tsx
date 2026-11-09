@@ -1,12 +1,15 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertCircle,
+  ArrowLeft,
+  ArrowRight,
   ArrowUp,
   CheckCircle2,
   ChevronRight,
   Download,
   File as FileIcon,
   FileArchive,
+  FileOutput,
   FileText,
   Folder,
   FolderOpen,
@@ -15,6 +18,8 @@ import {
   Info,
   Loader2,
   PackageOpen,
+  RotateCcw,
+  RotateCw,
   Save,
   Upload,
   X,
@@ -31,7 +36,7 @@ type ArchiveFormat = string
 type EntryKind = 'file' | 'directory' | 'container'
 type SortKey = 'name' | 'size' | 'packed' | 'time'
 type SortDir = 1 | -1
-type BusyState = 'reading' | 'adding' | 'extracting' | null
+type BusyState = 'reading' | 'adding' | 'extracting' | 'writing' | 'nested' | null
 type Tone = 'info' | 'success' | 'error'
 
 interface ArchiveEntry {
@@ -100,10 +105,103 @@ interface SaveFileResult {
   error?: string
 }
 
+interface ChoosePathResult {
+  canceled: boolean
+  filePath: string | null
+  error?: string
+}
+
+interface SaveScsModResult {
+  success: boolean
+  fileCount?: number
+  path?: string
+  error?: string
+}
+
+interface SaveScsCopyResult {
+  success: boolean
+  outputPath?: string
+  size?: number
+  edited?: string[]
+  error?: string
+}
+
 interface EditingFile {
   name: string
   content: string
   isDirty: boolean
+}
+
+type NavigationType = 'folder' | 'editor' | 'image'
+
+interface NavigationEntry {
+  type: NavigationType
+  path: string
+  entryName?: string
+}
+
+interface NavigationState {
+  history: NavigationEntry[]
+  index: number
+}
+
+interface ArchiveFrame {
+  archive: ArchiveInfo
+  currentPath: string
+  navigation: NavigationState
+  dragSessionId: string | null
+  scsEdits: Record<string, string>
+  scsSavedEdits: Record<string, string>
+  scsModPath: string | null
+  selected: Set<string>
+  nestedModified: boolean
+  nestedInfo: NestedInfo | null
+}
+
+interface NestedInfo {
+  outerArchivePath: string
+  entryName: string
+  filePath: string
+  sessionId: string
+}
+
+interface OpenNestedResult {
+  ok: boolean
+  cached?: boolean
+  needsConfirmation?: boolean
+  entrySize?: number
+  filePath?: string
+  sessionId?: string
+  entryName?: string
+  outerArchivePath?: string
+  outerSize?: number
+  outerMtimeMs?: number
+  error?: string
+}
+
+interface WriteBackResult {
+  ok: boolean
+  needsWarning?: boolean
+  innerSize?: number
+  solid?: boolean
+  outerFormat?: string
+  entryName?: string
+  error?: string
+}
+
+interface DragPreparation {
+  signature: string
+  ready: boolean
+}
+
+interface PrepareDragResult {
+  success: boolean
+  ready?: boolean
+  skipped?: boolean
+  signature?: string
+  items?: string[]
+  tempDir?: string
+  error?: string
 }
 
 interface ImagePreview {
@@ -134,6 +232,52 @@ interface OpenExternalResult {
 
 const KOFI_URL = 'https://ko-fi.com/gokawa'
 const GITHUB_URL = 'https://github.com/alexgokawa/OpenZip'
+const SCS_MOD_STORE_PREFIX = 'openzip:scs-mod-target:'
+const AUTO_DRAG_PREP_LIMIT_BYTES = 200 * 1024 * 1024
+const NESTED_ARCHIVE_EXTENSIONS = new Set(['scs', 'zip', 'rar', '7z', 'tar', 'iso', 'cab'])
+const NESTED_WRITABLE_FORMATS = new Set(['zip', '7z', 'tar'])
+const NESTED_READ_ONLY_MESSAGE =
+  'This archive is opened from inside another archive. Extract it to edit it.'
+const NESTED_WRITEBACK_WARN_BYTES = 300 * 1024 * 1024
+
+function isWritableArchiveFormat(format: string): boolean {
+  return NESTED_WRITABLE_FORMATS.has(format)
+}
+
+function isNestedArchiveEntry(entryName: string): boolean {
+  return NESTED_ARCHIVE_EXTENSIONS.has(fileExtension(entryName))
+}
+
+function selectionBytesFor(
+  sizes: Map<string, number>,
+  entries: string[],
+): number {
+  return entries.reduce((total, entry) => total + (sizes.get(entry) ?? 0), 0)
+}
+
+function hasTopLevelFolder(roots: string[]): boolean {
+  return roots.some((root) => {
+    if (!root.endsWith('/')) return false
+    const name = root.slice(0, -1)
+    return name.length > 0 && !name.includes('/')
+  })
+}
+
+function readStoredScsModTarget(archivePath: string): string | null {
+  try {
+    return window.localStorage.getItem(`${SCS_MOD_STORE_PREFIX}${archivePath}`)
+  } catch {
+    return null
+  }
+}
+
+function storeScsModTarget(archivePath: string, target: string): void {
+  try {
+    window.localStorage.setItem(`${SCS_MOD_STORE_PREFIX}${archivePath}`, target)
+  } catch {
+    /* storage unavailable */
+  }
+}
 
 interface ProgressPayload {
   format: string
@@ -147,6 +291,7 @@ interface ProgressPayload {
 
 interface IpcRendererLike {
   invoke: (channel: string, ...args: unknown[]) => Promise<unknown>
+  send: (channel: string, ...args: unknown[]) => void
   on: (channel: string, listener: (event: unknown, payload: unknown) => void) => void
   removeListener: (
     channel: string,
@@ -425,7 +570,7 @@ const EDITABLE_EXTENSIONS = new Set([
 ])
 
 function baseName(path: string): string {
-  const parts = path.split('/')
+  const parts = path.split(/[\\/]/)
   return parts[parts.length - 1] || path
 }
 
@@ -436,6 +581,20 @@ function fileExtension(path: string): string {
 }
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'bmp', 'webp', 'ico', 'gif'])
+
+const BINARY_EXTENSIONS = new Set([
+  'pmd',
+  'pmg',
+  'pmc',
+  'pma',
+  'tobj',
+  'dds',
+  'tga',
+  'ogg',
+  'bank',
+  'snd',
+  'scs',
+])
 
 const ARCHIVE_EXTENSIONS = new Set([
   'zip',
@@ -456,6 +615,21 @@ function isImageFile(path: string): boolean {
 
 function isArchiveFile(path: string): boolean {
   return ARCHIVE_EXTENSIONS.has(fileExtension(path))
+}
+
+function createDragSessionId(): string {
+  const value =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return value.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 96)
+}
+
+function dragSignature(roots: string[], entries: string[]): string {
+  return JSON.stringify({
+    roots: [...new Set(roots)].sort(),
+    entries: [...new Set(entries)].sort(),
+  })
 }
 
 function isEditableFile(path: string): boolean {
@@ -497,6 +671,12 @@ function editorLanguageLabel(path: string): string {
 
 function App() {
   const [archive, setArchive] = useState<ArchiveInfo | null>(null)
+  const [appVersion, setAppVersion] = useState('')
+  const [archiveStack, setArchiveStack] = useState<ArchiveFrame[]>([])
+  const [nestedInfo, setNestedInfo] = useState<NestedInfo | null>(null)
+  const [nestedModified, setNestedModified] = useState(false)
+  const parentModifiedByWritebackRef = useRef(false)
+  const archiveStackRef = useRef<ArchiveFrame[]>([])
   const [currentPath, setCurrentPath] = useState('')
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [sortKey, setSortKey] = useState<SortKey>('name')
@@ -515,6 +695,10 @@ function App() {
   const [darkMode, setDarkMode] = useState<boolean>(getInitialDarkMode)
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null)
   const [isSavingFile, setIsSavingFile] = useState(false)
+  const [scsEdits, setScsEdits] = useState<Record<string, string>>({})
+  const [scsSavedEdits, setScsSavedEdits] = useState<Record<string, string>>({})
+  const [scsModPath, setScsModPath] = useState<string | null>(null)
+  const [navigation, setNavigation] = useState<NavigationState>({ history: [], index: -1 })
   const [imagePreview, setImagePreview] = useState<ImagePreview | null>(null)
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null)
   const [dragActive, setDragActive] = useState(false)
@@ -523,6 +707,26 @@ function App() {
   const ipcRef = useRef<IpcRendererLike | null>(getIpc())
   const lastClickIndex = useRef<number | null>(null)
   const dragDepth = useRef(0)
+  const dragSessionRef = useRef<string | null>(null)
+  const dragPrepRef = useRef<DragPreparation>({ signature: '', ready: false })
+  const dragRequestRef = useRef(0)
+  const dragOutRef = useRef(false)
+  const selectAllRef = useRef(false)
+
+  useEffect(() => {
+    const ipc = ipcRef.current
+    if (!ipc) return
+    void ipc
+      .invoke('app:getVersion')
+      .then((result) => {
+        const info = result as { version?: unknown; packaged?: unknown } | null
+        if (!info || typeof info.version !== 'string') return
+        setAppVersion(`v${info.version}${info.packaged === true ? '' : '-dev'}`)
+      })
+      .catch(() => {
+        /* version label is optional */
+      })
+  }, [])
 
   /* ----- system theme (Windows light/dark, live) ----- */
 
@@ -585,6 +789,82 @@ function App() {
     [archive, selected],
   )
 
+  const entrySizeMap = useMemo(() => {
+    const sizes = new Map<string, number>()
+    if (!archive) return sizes
+    for (const entry of archive.entries) {
+      // Packed HashFS texture rows expose size 0; use the packed size as a
+      // safe fallback so the automatic-preparation cap cannot undercount them.
+      sizes.set(entry.name, Math.max(entry.size, entry.compressedSize ?? 0))
+    }
+    return sizes
+  }, [archive])
+
+  const dragSelection = useMemo(() => {
+    if (!archive) {
+      return {
+        roots: [] as string[],
+        entries: [] as string[],
+        signature: '',
+        selectionBytes: 0,
+        hasTopLevelFolder: false,
+        archiveIsLarge: false,
+      }
+    }
+    const roots = [...selected].sort()
+    const entries = collectSelection(archive.entries, selected) ?? []
+    return {
+      roots,
+      entries,
+      signature: dragSignature(roots, entries),
+      selectionBytes: selectionBytesFor(entrySizeMap, entries),
+      hasTopLevelFolder: hasTopLevelFolder(roots),
+      archiveIsLarge: archive.fileSize > AUTO_DRAG_PREP_LIMIT_BYTES,
+    }
+  }, [archive, entrySizeMap, selected])
+
+  const isScsContainer = Boolean(
+    archive && archive.entries.length === 1 && archive.entries[0].kind === 'container',
+  )
+  const isNestedArchive = archiveStack.length > 0
+  const nestedReadOnlyReason = !isNestedArchive || !archive
+    ? null
+    : !isWritableArchiveFormat(archive.format)
+      ? 'The inner archive is read-only.'
+      : !archiveStack.every((frame) => isWritableArchiveFormat(frame.archive.format))
+        ? 'The outer archive is read-only.'
+        : null
+  const nestedCanEdit = isNestedArchive && !nestedReadOnlyReason
+  const nestedWriteBlocked = isNestedArchive && !nestedCanEdit
+  const nestedReadOnlyMessage = nestedReadOnlyReason
+    ? `${NESTED_READ_ONLY_MESSAGE} ${nestedReadOnlyReason}`
+    : NESTED_READ_ONLY_MESSAGE
+  const archiveChainLabel = archive
+    ? [...archiveStack.map((frame) => frame.archive.fileName), archive.fileName].join(' > ')
+    : ''
+  const isHashFsArchive = Boolean(
+    archive && archive.format === 'scs' && !isScsContainer && archive.entries.length > 0,
+  )
+  const scsEditedCount = Object.keys(scsEdits).length
+  const scsHasUnappliedEdits = useMemo(() => {
+    const keys = new Set([...Object.keys(scsEdits), ...Object.keys(scsSavedEdits)])
+    for (const key of keys) {
+      if (scsEdits[key] !== scsSavedEdits[key]) return true
+    }
+    return false
+  }, [scsEdits, scsSavedEdits])
+
+  const navHistory = navigation.history
+  const navIndex = navigation.index
+  const canNavigateBack =
+    Boolean(editingFile || imagePreview) || navIndex > 0 || archiveStack.length > 0
+  const canNavigateForward =
+    !editingFile && !imagePreview && navIndex >= 0 && navIndex < navHistory.length - 1
+  const canNavigateUp =
+    Boolean(editingFile || imagePreview) ||
+    Boolean(archive && currentPath) ||
+    archiveStack.length > 0
+
   /* ----- actions ----- */
 
   const resetState = useCallback(() => {
@@ -593,13 +873,383 @@ function App() {
     setProgress(null)
   }, [])
 
+  useEffect(() => {
+    archiveStackRef.current = archiveStack
+  }, [archiveStack])
+
+  const cleanupDragSession = useCallback(async () => {
+    const ipc = ipcRef.current
+    const sessionId = dragSessionRef.current
+    dragSessionRef.current = null
+    dragPrepRef.current = { signature: '', ready: false }
+    dragRequestRef.current += 1
+
+    if (!ipc || !sessionId) return
+    try {
+      await ipc.invoke('archive:cleanupDrag', { sessionId })
+    } catch {
+      /* best effort */
+    }
+  }, [])
+
+  const invalidateDragPreparation = useCallback(() => {
+    dragPrepRef.current = { signature: '', ready: false }
+    dragRequestRef.current += 1
+    setProgress(null)
+  }, [])
+
+  const popNestedArchive = useCallback(async () => {
+    const frame = archiveStack[archiveStack.length - 1]
+    if (!frame) return
+    const ipc = ipcRef.current
+    const nestedDragSession = dragSessionRef.current
+
+    setArchiveStack((current) => current.slice(0, -1))
+    setArchive(frame.archive)
+    setCurrentPath(frame.currentPath)
+    setSelected(new Set(frame.selected))
+    setNavigation(frame.navigation)
+    setScsEdits(frame.scsEdits)
+    setScsSavedEdits(frame.scsSavedEdits)
+    setScsModPath(frame.scsModPath)
+    setNestedInfo(frame.nestedInfo)
+    setNestedModified(
+      frame.nestedModified || parentModifiedByWritebackRef.current,
+    )
+    parentModifiedByWritebackRef.current = false
+    dragSessionRef.current = frame.dragSessionId
+    dragPrepRef.current = { signature: '', ready: false }
+    dragRequestRef.current += 1
+    setEditingFile(null)
+    setImagePreview(null)
+    setProgress(null)
+    setStatus({ tone: 'info', text: `Returned to ${frame.archive.fileName}` })
+
+    if (ipc && nestedDragSession) {
+      void ipc.invoke('archive:cleanupDrag', { sessionId: nestedDragSession }).catch(() => {})
+    }
+  }, [archiveStack])
+
+  const commitNestedChanges = useCallback(async (): Promise<boolean> => {
+    if (!isNestedArchive || !nestedModified || !nestedInfo || !archive) return true
+    const parent = archiveStack[archiveStack.length - 1]
+    const ipc = ipcRef.current
+    if (!parent || !ipc) return false
+
+    const innerName = baseName(nestedInfo.entryName)
+    const outerName = parent.archive.fileName
+
+    if (!window.confirm(`Save changes to ${innerName} inside ${outerName}?`)) {
+      await ipc
+        .invoke('archive:discardNested', {
+          outerArchivePath: parent.archive.filePath,
+          nestedFilePath: archive.filePath,
+        })
+        .catch(() => {})
+      setNestedModified(false)
+      setNestedInfo(null)
+      return true
+    }
+
+    setBusy('writing')
+    setProgress(null)
+    setStatus({ tone: 'info', text: `Writing ${innerName} back to ${outerName}…` })
+
+    try {
+      let result = (await ipc.invoke('archive:writeBackNested', {
+        outerArchivePath: parent.archive.filePath,
+        entryName: nestedInfo.entryName,
+        nestedFilePath: archive.filePath,
+        confirmed: false,
+      })) as WriteBackResult
+
+      if (result?.needsWarning) {
+        const reasons: string[] = []
+        if (result.solid) {
+          reasons.push('The outer archive is a solid 7z; updating it may take a while.')
+        }
+        if ((result.innerSize ?? 0) > NESTED_WRITEBACK_WARN_BYTES) {
+          reasons.push(
+            `The inner archive is ${formatBytes(result.innerSize ?? 0)}; writing it back may take a while.`,
+          )
+        }
+        if (!window.confirm(`${reasons.join('\n\n')}\n\nContinue?`)) {
+          setStatus({ tone: 'info', text: 'Write-back canceled.' })
+          return false
+        }
+        result = (await ipc.invoke('archive:writeBackNested', {
+          outerArchivePath: parent.archive.filePath,
+          entryName: nestedInfo.entryName,
+          nestedFilePath: archive.filePath,
+          confirmed: true,
+        })) as WriteBackResult
+      }
+
+      if (!result?.ok) {
+        setStatus({
+          tone: 'error',
+          text: result?.error ?? 'Could not write the nested archive back to the outer archive.',
+        })
+        return false
+      }
+
+      const nestedDrag = dragSessionRef.current
+      dragSessionRef.current = null
+      dragPrepRef.current = { signature: '', ready: false }
+      dragRequestRef.current += 1
+      if (nestedDrag) {
+        await ipc
+          .invoke('archive:cleanupDrag', { sessionId: nestedDrag })
+          .catch(() => {})
+      }
+
+      parentModifiedByWritebackRef.current = archiveStack.length > 1
+      setNestedModified(false)
+      setNestedInfo(null)
+      setProgress(null)
+      setStatus({ tone: 'success', text: `${innerName} written back to ${outerName}.` })
+      return true
+    } catch (error) {
+      setStatus({
+        tone: 'error',
+        text:
+          error instanceof Error
+            ? error.message
+            : 'Could not write the nested archive back to the outer archive.',
+      })
+      return false
+    } finally {
+      setBusy(null)
+    }
+  }, [archive, archiveStack, isNestedArchive, nestedInfo, nestedModified])
+
+  const prepareDragSelection = useCallback(
+    async (
+      roots: string[],
+      entries: string[],
+      signature: string,
+      selectionBytes: number,
+      automatic: boolean,
+      announce: boolean,
+    ) => {
+      const ipc = ipcRef.current
+      const sessionId = dragSessionRef.current
+      if (!ipc || !archive || !sessionId || entries.length === 0) return false
+
+      const requestId = ++dragRequestRef.current
+      if (announce) {
+        setStatus({ tone: 'info', text: 'Preparing files…' })
+      }
+
+      try {
+        const result = (await ipc.invoke('archive:prepareDrag', {
+          sessionId,
+          archivePath: archive.filePath,
+          roots,
+          entries,
+          automatic,
+          selectionBytes,
+        })) as PrepareDragResult
+
+        if (requestId !== dragRequestRef.current) return false
+
+        if (!result || !result.success || !result.ready) {
+          dragPrepRef.current = { signature, ready: false }
+          setProgress(null)
+          if (announce && !result?.skipped) {
+            setStatus({
+              tone: 'error',
+              text: result?.error ?? 'Could not prepare these entries for dragging.',
+            })
+          }
+          return false
+        }
+
+        dragPrepRef.current = { signature: result.signature ?? signature, ready: true }
+        setProgress(null)
+        if (announce) {
+          setStatus({ tone: 'success', text: 'Files ready — drag again to drop them.' })
+        }
+        return true
+      } catch (error) {
+        dragPrepRef.current = { signature, ready: false }
+        setProgress(null)
+        if (announce) {
+          setStatus({
+            tone: 'error',
+            text: error instanceof Error ? error.message : 'Could not prepare these entries for dragging.',
+          })
+        }
+        return false
+      }
+    },
+    [archive],
+  )
+
+  useEffect(() => {
+    if (!archive || !dragSelection.signature || dragSelection.entries.length === 0) {
+      dragPrepRef.current = { signature: '', ready: false }
+      return
+    }
+
+    const automaticAllowed =
+      !selectAllRef.current &&
+      dragSelection.selectionBytes <= AUTO_DRAG_PREP_LIMIT_BYTES &&
+      !(dragSelection.hasTopLevelFolder && dragSelection.archiveIsLarge)
+
+    if (!automaticAllowed) return
+
+    const timer = setTimeout(() => {
+      void prepareDragSelection(
+        dragSelection.roots,
+        dragSelection.entries,
+        dragSelection.signature,
+        dragSelection.selectionBytes,
+        true,
+        false,
+      )
+    }, 250)
+
+    return () => clearTimeout(timer)
+  }, [archive, dragSelection, prepareDragSelection])
+
+  useEffect(() => {
+    const ipc = ipcRef.current
+    if (!ipc) return
+
+    const handler = (_event: unknown, message: unknown) => {
+      setStatus({
+        tone: 'error',
+        text: typeof message === 'string' ? message : 'Could not start dragging these files.',
+      })
+    }
+
+    ipc.on('archive:dragError', handler)
+    return () => ipc.removeListener('archive:dragError', handler)
+  }, [])
+
+  const pushNavigation = useCallback((entry: NavigationEntry) => {
+    setNavigation((previous) => {
+      const stack = previous.history.slice(0, previous.index + 1)
+      const current = stack[stack.length - 1]
+      if (
+        current &&
+        current.type === entry.type &&
+        current.path === entry.path &&
+        current.entryName === entry.entryName
+      ) {
+        return { history: stack, index: stack.length - 1 }
+      }
+      stack.push(entry)
+      return { history: stack, index: stack.length - 1 }
+    })
+  }, [])
+
+  const navigateToFolder = useCallback(
+    (folderPath: string) => {
+      if (busy) return
+      setEditingFile(null)
+      setImagePreview(null)
+      setCurrentPath(folderPath)
+      setSelected(new Set())
+      lastClickIndex.current = null
+      pushNavigation({ type: 'folder', path: folderPath })
+      setStatus({
+        tone: 'info',
+        text: folderPath ? `/${folderPath}` : archive ? `${archive.fileName} root` : 'Archive root',
+      })
+    },
+    [archive, busy, pushNavigation],
+  )
+
+  const closeOverlayToFolder = useCallback((folderPath: string, statusText?: string) => {
+    setEditingFile(null)
+    setImagePreview(null)
+    setCurrentPath(folderPath)
+    setSelected(new Set())
+    lastClickIndex.current = null
+    setNavigation((previous) => {
+      let targetIndex = previous.index
+      if (previous.history[targetIndex] && previous.history[targetIndex].type !== 'folder') {
+        for (let i = targetIndex - 1; i >= 0; i -= 1) {
+          if (previous.history[i].type === 'folder') {
+            targetIndex = i
+            break
+          }
+        }
+      }
+      return { ...previous, index: targetIndex }
+    })
+    if (statusText) setStatus({ tone: 'info', text: statusText })
+  }, [])
+
+  const refreshArchive = useCallback(async () => {
+    const ipc = ipcRef.current
+    if (!ipc || !archive || busy) return
+
+    setBusy('reading')
+    setStatus({ tone: 'info', text: 'Refreshing archive…' })
+    try {
+      const result = (await ipc.invoke('archive:refresh', archive.filePath)) as ReadResult
+      if (!result || !result.ok || !result.entries || !result.stats) {
+        setStatus({ tone: 'error', text: result?.error ?? 'Could not refresh this archive.' })
+        return
+      }
+
+      setArchive((current) => {
+        if (!current) return current
+        return {
+          ...current,
+          entries: result.entries ?? current.entries,
+          stats: result.stats ?? current.stats,
+          fileSize: result.fileSize ?? current.fileSize,
+          note: result.note ?? current.note,
+        }
+      })
+      setSelected(new Set())
+
+      const folderStillExists =
+        !currentPath || result.entries.some((entry) => entry.name.startsWith(currentPath))
+      if (!folderStillExists) {
+        setCurrentPath('')
+        pushNavigation({ type: 'folder', path: '' })
+      }
+      setStatus({
+        tone: 'success',
+        text: `Refreshed ${archive.fileName} — ${result.stats.fileCount.toLocaleString()} files`,
+      })
+    } catch (error) {
+      setStatus({
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Could not refresh this archive.',
+      })
+    } finally {
+      setBusy(null)
+    }
+  }, [archive, busy, currentPath, pushNavigation])
+
   const loadArchive = useCallback(
     async (filePath: string) => {
       const ipc = ipcRef.current
       if (!ipc) return
 
+      await cleanupDragSession()
+      for (const frame of archiveStackRef.current) {
+        if (!frame.dragSessionId) continue;
+        await ipc
+          .invoke('archive:cleanupDrag', { sessionId: frame.dragSessionId })
+          .catch(() => {})
+      }
+      await ipc.invoke('archive:cleanupNested').catch(() => {})
+      setArchiveStack([])
+      setNestedInfo(null)
+      setNestedModified(false)
       setEditingFile(null)
       setImagePreview(null)
+      setScsEdits({})
+      setScsSavedEdits({})
+      setScsModPath(null)
+      setNavigation({ history: [], index: -1 })
       setBusy('reading')
       setProgress(null)
       setStatus({ tone: 'info', text: 'Reading archive…' })
@@ -623,6 +1273,17 @@ function App() {
           stats: result.stats,
           note: result.note ?? null,
         })
+        const loadedPath = result.filePath ?? filePath
+        const loadedAsHashFs =
+          result.format === 'scs' &&
+          !(result.entries.length === 1 && result.entries[0].kind === 'container')
+        if (loadedAsHashFs) {
+          setScsModPath(readStoredScsModTarget(loadedPath))
+        }
+        dragSessionRef.current = createDragSessionId()
+        dragPrepRef.current = { signature: '', ready: false }
+        dragRequestRef.current += 1
+        setNavigation({ history: [{ type: 'folder', path: '' }], index: 0 })
         resetState()
         const isContainer =
           result.entries.length === 1 && result.entries[0].kind === 'container'
@@ -643,7 +1304,7 @@ function App() {
         setBusy(null)
       }
     },
-    [resetState],
+    [cleanupDragSession, resetState],
   )
 
   const handleOpenArchive = useCallback(async () => {
@@ -654,8 +1315,12 @@ function App() {
     if (!picked || picked.canceled || !picked.filePath) return
 
     if (editingFile?.isDirty && !window.confirm('Discard unsaved changes?')) return
+    if (scsHasUnappliedEdits && !window.confirm('Discard HashFS edits that were not saved to the mod?')) {
+      return
+    }
+    if (!(await commitNestedChanges())) return
     await loadArchive(picked.filePath)
-  }, [busy, editingFile, loadArchive])
+  }, [busy, commitNestedChanges, editingFile, loadArchive, scsHasUnappliedEdits])
 
   useEffect(() => {
     const ipc = ipcRef.current
@@ -717,24 +1382,54 @@ function App() {
   }, [archive, busy, selectedEntryNames])
 
   const handleClose = useCallback(() => {
-    if (busy) return
-    if (editingFile?.isDirty && !window.confirm('Discard unsaved changes?')) return
-    setEditingFile(null)
-    setImagePreview(null)
-    setArchive(null)
-    resetState()
-    setStatus({ tone: 'info', text: 'Archive closed' })
-  }, [busy, editingFile, resetState])
+    void (async () => {
+      if (busy) return
+      if (editingFile?.isDirty && !window.confirm('Discard unsaved changes?')) return
+      if (
+        scsHasUnappliedEdits &&
+        !window.confirm('Discard HashFS edits that were not saved to the mod?')
+      ) {
+        return
+      }
+      if (!(await commitNestedChanges())) return
+      void cleanupDragSession()
+      const ipc = ipcRef.current
+      for (const frame of archiveStack) {
+        if (!frame.dragSessionId) continue;
+        void ipc?.invoke('archive:cleanupDrag', { sessionId: frame.dragSessionId }).catch(() => {})
+      }
+      void ipc?.invoke('archive:cleanupNested').catch(() => {})
+      setArchiveStack([])
+      setNestedInfo(null)
+      setNestedModified(false)
+      setEditingFile(null)
+      setImagePreview(null)
+      setScsEdits({})
+      setScsSavedEdits({})
+      setScsModPath(null)
+      setNavigation({ history: [], index: -1 })
+      setArchive(null)
+      resetState()
+      setStatus({ tone: 'info', text: 'Archive closed' })
+    })()
+  }, [
+    archiveStack,
+    busy,
+    cleanupDragSession,
+    commitNestedChanges,
+    editingFile,
+    resetState,
+    scsHasUnappliedEdits,
+  ])
 
   const handleCloseEditor = useCallback(() => {
     if (!editingFile) return
     if (editingFile.isDirty && !window.confirm('Discard unsaved changes?')) return
-    setEditingFile(null)
-    setStatus({ tone: 'info', text: 'Editor closed' })
-  }, [editingFile])
+    closeOverlayToFolder(currentPath, 'Editor closed')
+  }, [closeOverlayToFolder, currentPath, editingFile])
 
   const handleOpenImage = useCallback(
-    async (entryName: string) => {
+    async (entryName: string, recordHistory = true) => {
       const ipc = ipcRef.current
       if (!ipc || !archive || busy) return
 
@@ -754,6 +1449,9 @@ function App() {
         }
 
         setImagePreview({ name: entryName, dataUrl: result.base64 })
+        if (recordHistory) {
+          pushNavigation({ type: 'image', path: currentPath, entryName })
+        }
         setStatus({ tone: 'info', text: `Viewing ${baseName(entryName)}` })
       } catch (error) {
         setStatus({
@@ -764,7 +1462,7 @@ function App() {
         setBusy(null)
       }
     },
-    [archive, busy],
+    [archive, busy, currentPath, pushNavigation],
   )
 
   const refreshArchiveEntries = useCallback(async (filePath: string) => {
@@ -792,11 +1490,46 @@ function App() {
   const handleDroppedPaths = useCallback(
     async (paths: string[]) => {
       if (busy || paths.length === 0) return
+      const ipc = ipcRef.current
+      if (!ipc) return
+
+      const writable = archive
+        ? archive.format === 'zip' || archive.format === '7z' || archive.format === 'tar'
+        : false
+      const canAddDroppedArchive =
+        archive !== null && writable && (!isNestedArchive || nestedCanEdit)
 
       if (paths.length === 1 && isArchiveFile(paths[0])) {
-        if (editingFile?.isDirty && !window.confirm('Discard unsaved changes?')) return
-        await loadArchive(paths[0])
-        return
+        let shouldOpen = !canAddDroppedArchive
+        if (canAddDroppedArchive) {
+          let choice: 'add' | 'open' | 'cancel'
+          try {
+            choice = (await ipc.invoke('dialog:dropChoice', {
+              fileName: baseName(paths[0]),
+            })) as 'add' | 'open' | 'cancel'
+          } catch (error) {
+            setStatus({
+              tone: 'error',
+              text: error instanceof Error ? error.message : 'Could not ask what to do with this archive.',
+            })
+            return
+          }
+          if (choice === 'cancel') return
+          shouldOpen = choice === 'open'
+        }
+
+        if (shouldOpen) {
+          if (editingFile?.isDirty && !window.confirm('Discard unsaved changes?')) return
+          if (
+            scsHasUnappliedEdits &&
+            !window.confirm('Discard HashFS edits that were not saved to the mod?')
+          ) {
+            return
+          }
+          if (!(await commitNestedChanges())) return
+          await loadArchive(paths[0])
+          return
+        }
       }
 
       if (!archive) {
@@ -804,18 +1537,19 @@ function App() {
         return
       }
 
+      if (isNestedArchive && !nestedCanEdit) {
+        setStatus({ tone: 'error', text: nestedReadOnlyMessage })
+        return
+      }
+
       const isContainer =
         archive.entries.length === 1 && archive.entries[0].kind === 'container'
-      const writable = archive.format === 'zip' || archive.format === '7z' || archive.format === 'tar'
       if (isContainer || !writable) {
         setStatus({ tone: 'error', text: 'This archive format is read-only. Cannot inject files.' })
         return
       }
 
       if (!window.confirm(`Add ${paths.length} item(s) to archive?`)) return
-
-      const ipc = ipcRef.current
-      if (!ipc) return
 
       const targetDir = currentPath.replace(/\/$/, '')
       setBusy('adding')
@@ -835,6 +1569,8 @@ function App() {
 
         await refreshArchiveEntries(archive.filePath)
         setSelected(new Set())
+        invalidateDragPreparation()
+        if (isNestedArchive) setNestedModified(true)
         const added = result.added ?? paths.length
         setStatus({
           tone: 'success',
@@ -849,16 +1585,31 @@ function App() {
         setBusy(null)
       }
     },
-    [archive, busy, currentPath, editingFile, loadArchive, refreshArchiveEntries],
+    [
+      archive,
+      busy,
+      commitNestedChanges,
+      currentPath,
+      editingFile,
+      invalidateDragPreparation,
+      isNestedArchive,
+      loadArchive,
+      nestedCanEdit,
+      nestedReadOnlyMessage,
+      refreshArchiveEntries,
+      scsHasUnappliedEdits,
+    ],
   )
 
   const handleDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (dragOutRef.current) return
     event.preventDefault()
     dragDepth.current += 1
     setDragActive(true)
   }, [])
 
   const handleDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (dragOutRef.current) return
     event.preventDefault()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
   }, [])
@@ -874,6 +1625,7 @@ function App() {
       event.preventDefault()
       dragDepth.current = 0
       setDragActive(false)
+      if (dragOutRef.current) return
 
       const files = Array.from(event.dataTransfer?.files ?? [])
       if (files.length === 0) return
@@ -919,9 +1671,21 @@ function App() {
   )
 
   const handleOpenFile = useCallback(
-    async (entryName: string) => {
+    async (entryName: string, recordHistory = true) => {
       const ipc = ipcRef.current
       if (!ipc || !archive || busy) return
+
+      if (isHashFsArchive && scsEdits[entryName] !== undefined) {
+        setEditingFile({ name: entryName, content: scsEdits[entryName], isDirty: false })
+        if (recordHistory) {
+          pushNavigation({ type: 'editor', path: currentPath, entryName })
+        }
+        setStatus({
+          tone: 'info',
+          text: `Editing ${baseName(entryName)} — opened from the edited mod overlay`,
+        })
+        return
+      }
 
       setBusy('reading')
       setStatus({ tone: 'info', text: `Opening ${baseName(entryName)}…` })
@@ -938,9 +1702,14 @@ function App() {
         }
 
         setEditingFile({ name: entryName, content: result.content, isDirty: false })
+        if (recordHistory) {
+          pushNavigation({ type: 'editor', path: currentPath, entryName })
+        }
         setStatus({
           tone: 'info',
-          text: `Editing ${baseName(entryName)} — Ctrl+S saves to the archive`,
+          text: isHashFsArchive
+            ? `Editing ${baseName(entryName)} — Ctrl+S saves to the mod package`
+            : `Editing ${baseName(entryName)} — Ctrl+S saves to the archive`,
         })
       } catch (error) {
         setStatus({
@@ -951,12 +1720,368 @@ function App() {
         setBusy(null)
       }
     },
-    [archive, busy],
+    [archive, busy, currentPath, isHashFsArchive, pushNavigation, scsEdits],
   )
+
+  const restoreNavigation = useCallback(
+    (index: number) => {
+      const entry = navHistory[index]
+      if (!entry || busy) return
+
+      setNavigation((previous) => ({ ...previous, index }))
+      setSelected(new Set())
+      lastClickIndex.current = null
+
+      if (entry.type === 'folder') {
+        setEditingFile(null)
+        setImagePreview(null)
+        setCurrentPath(entry.path)
+        setStatus({
+          tone: 'info',
+          text: entry.path ? `/${entry.path}` : archive ? `${archive.fileName} root` : 'Archive root',
+        })
+        return
+      }
+
+      setImagePreview(null)
+      setEditingFile(null)
+      setCurrentPath(entry.path)
+      if (!entry.entryName) return
+
+      if (entry.type === 'editor') {
+        void handleOpenFile(entry.entryName, false)
+      } else {
+        void handleOpenImage(entry.entryName, false)
+      }
+    },
+    [archive, busy, handleOpenFile, handleOpenImage, navHistory],
+  )
+
+  const handleNavigateBack = useCallback(() => {
+    if (busy) return
+
+    if (editingFile || imagePreview) {
+      if (editingFile?.isDirty && !window.confirm('Discard unsaved changes?')) return
+      const folderPath = editingFile ? parentPath(editingFile.name) : currentPath
+      closeOverlayToFolder(folderPath, 'Back to archive folder')
+      return
+    }
+
+    if (navIndex > 0) {
+      restoreNavigation(navIndex - 1)
+      return
+    }
+    if (archiveStack.length > 0) {
+      if (nestedModified) {
+        void (async () => {
+          if (await commitNestedChanges()) void popNestedArchive()
+        })()
+        return
+      }
+      void popNestedArchive()
+    }
+  }, [
+    archiveStack.length,
+    busy,
+    closeOverlayToFolder,
+    commitNestedChanges,
+    currentPath,
+    editingFile,
+    imagePreview,
+    navIndex,
+    nestedModified,
+    popNestedArchive,
+    restoreNavigation,
+  ])
+
+  const handleNavigateForward = useCallback(() => {
+    if (busy || editingFile || imagePreview) return
+    if (navIndex < navHistory.length - 1) restoreNavigation(navIndex + 1)
+  }, [busy, editingFile, imagePreview, navHistory.length, navIndex, restoreNavigation])
+
+  const handleNavigateUp = useCallback(() => {
+    if (busy) return
+
+    if (editingFile || imagePreview) {
+      if (editingFile?.isDirty && !window.confirm('Discard unsaved changes?')) return
+      const folderPath = editingFile ? parentPath(editingFile.name) : currentPath
+      closeOverlayToFolder(folderPath, 'Returned to archive folder')
+      return
+    }
+
+    if (!archive || !currentPath) {
+      if (archiveStack.length > 0) {
+        if (nestedModified) {
+          void (async () => {
+            if (await commitNestedChanges()) void popNestedArchive()
+          })()
+          return
+        }
+        void popNestedArchive()
+      }
+      return
+    }
+    navigateToFolder(parentPath(currentPath))
+  }, [
+    archive,
+    archiveStack.length,
+    busy,
+    closeOverlayToFolder,
+    commitNestedChanges,
+    currentPath,
+    editingFile,
+    imagePreview,
+    navigateToFolder,
+    nestedModified,
+    popNestedArchive,
+  ])
+
+  const ensureScsModTarget = useCallback(async (): Promise<string | null> => {
+    const ipc = ipcRef.current
+    if (!ipc || !archive) return null
+    if (scsModPath) return scsModPath
+
+    const picked = (await ipc.invoke('archive:chooseScsModPath', {
+      archivePath: archive.filePath,
+    })) as ChoosePathResult
+    if (picked?.error) {
+      setStatus({ tone: 'error', text: picked.error })
+      return null
+    }
+    if (!picked || picked.canceled || !picked.filePath) return null
+
+    setScsModPath(picked.filePath)
+    storeScsModTarget(archive.filePath, picked.filePath)
+    return picked.filePath
+  }, [archive, scsModPath])
+
+  const handleChangeScsModTarget = useCallback(async () => {
+    const ipc = ipcRef.current
+    if (!ipc || !archive || busy) return
+    if (isNestedArchive && !nestedCanEdit) {
+      setStatus({ tone: 'error', text: nestedReadOnlyMessage })
+      return
+    }
+
+    const picked = (await ipc.invoke('archive:chooseScsModPath', {
+      archivePath: archive.filePath,
+    })) as ChoosePathResult
+    if (picked?.error) {
+      setStatus({ tone: 'error', text: picked.error })
+      return
+    }
+    if (!picked || picked.canceled || !picked.filePath) return
+
+    setScsModPath(picked.filePath)
+    storeScsModTarget(archive.filePath, picked.filePath)
+    setStatus({ tone: 'info', text: `Mod target set to ${picked.filePath}` })
+  }, [archive, busy, isNestedArchive, nestedCanEdit, nestedReadOnlyMessage])
+
+  const handleRevertScsEdit = useCallback(async () => {
+    const ipc = ipcRef.current
+    if (!ipc || !archive || !editingFile || !isHashFsArchive || isSavingFile) return
+    if (isNestedArchive && !nestedCanEdit) {
+      setStatus({ tone: 'error', text: nestedReadOnlyMessage })
+      return
+    }
+
+    setIsSavingFile(true)
+    try {
+      const original = (await ipc.invoke('archive:readFile', {
+        archivePath: archive.filePath,
+        entryName: editingFile.name,
+      })) as ReadFileResult
+      if (!original || !original.success || typeof original.content !== 'string') {
+        setStatus({ tone: 'error', text: original?.error ?? 'Could not reload the original file.' })
+        return
+      }
+
+      const hadSavedEdit = Object.prototype.hasOwnProperty.call(scsSavedEdits, editingFile.name)
+      const nextEdits = { ...scsEdits }
+      delete nextEdits[editingFile.name]
+
+      if (hadSavedEdit && scsModPath) {
+        const result = (await ipc.invoke('archive:saveScsMod', {
+          archivePath: archive.filePath,
+          modPath: scsModPath,
+          files: Object.entries(nextEdits).map(([entryName, content]) => ({ entryName, content })),
+        })) as SaveScsModResult
+        if (!result || !result.success) {
+          setStatus({ tone: 'error', text: result?.error ?? 'Could not update the mod package.' })
+          return
+        }
+      }
+
+      setScsEdits(nextEdits)
+      setScsSavedEdits((current) => {
+        const copy = { ...current }
+        delete copy[editingFile.name]
+        return copy
+      })
+      setEditingFile({ name: editingFile.name, content: original.content, isDirty: false })
+      invalidateDragPreparation()
+      setStatus({
+        tone: 'success',
+        text: `Reverted ${baseName(editingFile.name)}${
+          hadSavedEdit && scsModPath ? ' and updated the mod package' : ''
+        }`,
+      })
+    } catch (error) {
+      setStatus({
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Could not revert this edit.',
+      })
+    } finally {
+      setIsSavingFile(false)
+    }
+  }, [
+    archive,
+    editingFile,
+    invalidateDragPreparation,
+    isHashFsArchive,
+    isNestedArchive,
+    isSavingFile,
+    nestedCanEdit,
+    nestedReadOnlyMessage,
+    scsEdits,
+    scsModPath,
+    scsSavedEdits,
+  ])
+
+  const handleSaveScsCopy = useCallback(async () => {
+    const ipc = ipcRef.current
+    if (!ipc || !archive || !editingFile || !isHashFsArchive || busy || isSavingFile) return
+    if (isNestedArchive && !nestedCanEdit) {
+      setStatus({ tone: 'error', text: nestedReadOnlyMessage })
+      return
+    }
+
+    const currentEdits = { ...scsEdits }
+    if (editingFile.isDirty || currentEdits[editingFile.name] !== undefined) {
+      currentEdits[editingFile.name] = editingFile.content
+    }
+    if (Object.keys(currentEdits).length === 0) {
+      setStatus({ tone: 'info', text: 'Edit a file before saving a modified copy.' })
+      return
+    }
+
+    const picked = (await ipc.invoke('archive:chooseScsCopyPath', {
+      archivePath: archive.filePath,
+    })) as ChoosePathResult
+    if (picked?.error) {
+      setStatus({ tone: 'error', text: picked.error })
+      return
+    }
+    if (!picked || picked.canceled || !picked.filePath) return
+
+    setBusy('writing')
+    setIsSavingFile(true)
+    setProgress({
+      format: 'scs',
+      phase: 'writing',
+      percent: 0,
+      message: 'Preparing modified HashFS copy…',
+    })
+    setStatus({ tone: 'info', text: 'Writing modified HashFS copy…' })
+
+    try {
+      const result = (await ipc.invoke('archive:saveScsCopy', {
+        archivePath: archive.filePath,
+        outputPath: picked.filePath,
+        files: Object.entries(currentEdits).map(([entryName, content]) => ({
+          entryName,
+          content,
+        })),
+      })) as SaveScsCopyResult
+
+      if (!result || !result.success) {
+        setProgress(null)
+        setStatus({ tone: 'error', text: result?.error ?? 'Could not write the modified copy.' })
+        return
+      }
+
+      setProgress({
+        format: 'scs',
+        phase: 'done',
+        percent: 100,
+        done: result.edited?.length ?? null,
+        total: result.edited?.length ?? null,
+        message: 'Modified copy written',
+      })
+      setStatus({
+        tone: 'success',
+        text: `Modified copy saved to ${baseName(result.outputPath ?? picked.filePath)} (original untouched)`,
+      })
+    } catch (error) {
+      setProgress(null)
+      setStatus({
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Could not write the modified copy.',
+      })
+    } finally {
+      setBusy(null)
+      setIsSavingFile(false)
+    }
+  }, [
+    archive,
+    busy,
+    editingFile,
+    isHashFsArchive,
+    isNestedArchive,
+    isSavingFile,
+    nestedCanEdit,
+    nestedReadOnlyMessage,
+    scsEdits,
+  ])
 
   const handleSaveFile = useCallback(async () => {
     const ipc = ipcRef.current
     if (!ipc || !archive || !editingFile || isSavingFile) return
+    if (isNestedArchive && !nestedCanEdit) {
+      setStatus({ tone: 'error', text: nestedReadOnlyMessage })
+      return
+    }
+
+    if (isHashFsArchive) {
+      const target = await ensureScsModTarget()
+      if (!target) return
+
+      setIsSavingFile(true)
+      setStatus({ tone: 'info', text: `Saving ${baseName(editingFile.name)} to the mod package…` })
+      const nextEdits = { ...scsEdits, [editingFile.name]: editingFile.content }
+
+      try {
+        const result = (await ipc.invoke('archive:saveScsMod', {
+          archivePath: archive.filePath,
+          modPath: target,
+          files: Object.entries(nextEdits).map(([entryName, content]) => ({ entryName, content })),
+        })) as SaveScsModResult
+
+        if (!result || !result.success) {
+          setStatus({ tone: 'error', text: result?.error ?? 'Could not save to the mod package.' })
+          return
+        }
+
+        setScsEdits(nextEdits)
+        setScsSavedEdits(nextEdits)
+        setEditingFile((current) => (current ? { ...current, isDirty: false } : current))
+        invalidateDragPreparation()
+        setStatus({
+          tone: 'success',
+          text: `Saved ${result.fileCount ?? Object.keys(nextEdits).length} edited file${
+            (result.fileCount ?? 1) === 1 ? '' : 's'
+          } to ${baseName(target)} — original game archive untouched`,
+        })
+      } catch (error) {
+        setStatus({
+          tone: 'error',
+          text: error instanceof Error ? error.message : 'Could not save to the mod package.',
+        })
+      } finally {
+        setIsSavingFile(false)
+      }
+      return
+    }
 
     setIsSavingFile(true)
     setStatus({ tone: 'info', text: `Saving ${baseName(editingFile.name)}…` })
@@ -988,6 +2113,8 @@ function App() {
         return { ...current, entries, stats: { ...current.stats, totalSize } }
       })
 
+      invalidateDragPreparation()
+      if (isNestedArchive) setNestedModified(true)
       setStatus({
         tone: 'success',
         text: `Saved & updated ${editingFile.name} inside archive`,
@@ -1000,7 +2127,18 @@ function App() {
     } finally {
       setIsSavingFile(false)
     }
-  }, [archive, editingFile, isSavingFile])
+  }, [
+    archive,
+    editingFile,
+    ensureScsModTarget,
+    invalidateDragPreparation,
+    isHashFsArchive,
+    isNestedArchive,
+    isSavingFile,
+    nestedCanEdit,
+    nestedReadOnlyMessage,
+    scsEdits,
+  ])
 
   const toggleSort = useCallback((key: SortKey) => {
     setSortKey((currentKey) => {
@@ -1015,6 +2153,7 @@ function App() {
 
   const handleSelect = useCallback(
     (row: Row, index: number, event: React.MouseEvent) => {
+      selectAllRef.current = false
       setSelected((current) => {
         const next = new Set(current)
         if (event.shiftKey && lastClickIndex.current !== null) {
@@ -1034,19 +2173,241 @@ function App() {
     [rows],
   )
 
+  const handleRowDragStart = useCallback(
+    (event: React.DragEvent<HTMLTableRowElement>, row: Row) => {
+      if (!archive || busy) {
+        event.preventDefault()
+        return
+      }
+
+      const keys = selected.has(row.key) ? new Set(selected) : new Set([row.key])
+      if (!selected.has(row.key)) {
+        setSelected(keys)
+        lastClickIndex.current = null
+      }
+
+      const roots = [...keys].sort()
+      const entries = collectSelection(archive.entries, keys) ?? []
+      if (entries.length === 0) {
+        event.preventDefault()
+        setStatus({ tone: 'info', text: 'There are no files in this selection to drag.' })
+        return
+      }
+
+      // Electron requires the renderer to prevent Chromium's default drag and
+      // let the main process call webContents.startDrag during the gesture.
+      event.preventDefault()
+      event.dataTransfer.effectAllowed = 'copy'
+      dragOutRef.current = true
+      window.setTimeout(() => {
+        dragOutRef.current = false
+      }, 800)
+
+      const signature = dragSignature(roots, entries)
+      const selectionBytes = selectionBytesFor(entrySizeMap, entries)
+      const preparation = dragPrepRef.current
+      if (!preparation.ready || preparation.signature !== signature) {
+        void prepareDragSelection(
+          roots,
+          entries,
+          signature,
+          selectionBytes,
+          false,
+          true,
+        )
+        return
+      }
+
+      const ipc = ipcRef.current
+      const sessionId = dragSessionRef.current
+      if (!ipc || !sessionId) {
+        setStatus({ tone: 'error', text: 'The drag session is not ready.' })
+        return
+      }
+
+      ipc.send('archive:startDrag', { sessionId, signature })
+    },
+    [archive, busy, entrySizeMap, prepareDragSelection, selected],
+  )
+
+  const handleRowDragEnd = useCallback(() => {
+    dragOutRef.current = false
+  }, [])
+
+  const handleRowMouseDown = useCallback(
+    (event: React.MouseEvent<HTMLTableRowElement>, row: Row) => {
+      if (event.button !== 0 || !archive || busy || editingFile || imagePreview) return
+      if (row.type === 'container') return
+
+      selectAllRef.current = false
+      const keys = selected.has(row.key) ? new Set(selected) : new Set([row.key])
+      const roots = [...keys].sort()
+      const entries = collectSelection(archive.entries, keys) ?? []
+      if (entries.length === 0) return
+
+      const selectionBytes = selectionBytesFor(entrySizeMap, entries)
+      const automaticAllowed =
+        selectionBytes <= AUTO_DRAG_PREP_LIMIT_BYTES &&
+        !(hasTopLevelFolder(roots) && archive.fileSize > AUTO_DRAG_PREP_LIMIT_BYTES)
+      if (!automaticAllowed) return
+
+      const signature = dragSignature(roots, entries)
+      if (dragPrepRef.current.ready && dragPrepRef.current.signature === signature) return
+
+      void prepareDragSelection(roots, entries, signature, selectionBytes, true, false)
+    },
+    [
+      archive,
+      busy,
+      editingFile,
+      entrySizeMap,
+      imagePreview,
+      prepareDragSelection,
+      selected,
+    ],
+  )
+
+  const openNestedArchive = useCallback(
+    async (entryName: string) => {
+      const ipc = ipcRef.current
+      if (!ipc || !archive || busy || editingFile || imagePreview) return
+      if (!isNestedArchiveEntry(entryName)) return
+
+      const entry = archive.entries.find((candidate) => candidate.name === entryName)
+      if (!entry || entry.isDirectory) return
+
+      const parentFrame: ArchiveFrame = {
+        archive,
+        currentPath,
+        navigation,
+        dragSessionId: dragSessionRef.current,
+        scsEdits,
+        scsSavedEdits,
+        scsModPath,
+        selected: new Set(selected),
+        nestedModified,
+        nestedInfo,
+      }
+
+      setBusy('nested')
+      setProgress(null)
+      setStatus({ tone: 'info', text: `Extracting ${baseName(entryName)} from the outer archive…` })
+
+      try {
+        let result = (await ipc.invoke('archive:openNested', {
+          outerArchivePath: archive.filePath,
+          entryName,
+          confirmed: false,
+        })) as OpenNestedResult
+
+        if (result?.needsConfirmation) {
+          const size = result.entrySize ?? entry.size
+          const confirmed = window.confirm(
+            `This entry is ${formatBytes(size)}. Extract it and open it from inside ${archive.fileName}?`,
+          )
+          if (!confirmed) {
+            setStatus({ tone: 'info', text: 'Nested archive was not opened.' })
+            return
+          }
+          result = (await ipc.invoke('archive:openNested', {
+            outerArchivePath: archive.filePath,
+            entryName,
+            confirmed: true,
+          })) as OpenNestedResult
+        }
+
+        if (!result || !result.ok || !result.filePath) {
+          setStatus({
+            tone: 'error',
+            text: result?.error ?? 'Could not open this nested archive.',
+          })
+          return
+        }
+
+        const read = (await ipc.invoke('archive:read', result.filePath)) as ReadResult
+        if (!read || !read.ok || !read.entries || !read.stats) {
+          setStatus({
+            tone: 'error',
+            text: read?.error ?? 'Could not read the nested archive.',
+          })
+          return
+        }
+
+        setArchiveStack((current) => [...current, parentFrame])
+        setNestedInfo({
+          outerArchivePath: result.outerArchivePath ?? archive.filePath,
+          entryName: result.entryName ?? entryName,
+          filePath: result.filePath,
+          sessionId: result.sessionId ?? '',
+        })
+        setNestedModified(false)
+        dragSessionRef.current = createDragSessionId()
+        dragPrepRef.current = { signature: '', ready: false }
+        dragRequestRef.current += 1
+        setArchive({
+          filePath: read.filePath ?? result.filePath,
+          fileName:
+            read.fileName ?? result.entryName ?? baseName(result.filePath),
+          fileSize: read.fileSize ?? result.entrySize ?? 0,
+          format: read.format ?? 'archive',
+          entries: read.entries,
+          stats: read.stats,
+          note: read.note ?? null,
+        })
+        setEditingFile(null)
+        setImagePreview(null)
+        setScsEdits({})
+        setScsSavedEdits({})
+        setScsModPath(null)
+        setNavigation({ history: [{ type: 'folder', path: '' }], index: 0 })
+        setCurrentPath('')
+        setSelected(new Set())
+        setProgress(null)
+        setStatus({
+          tone: 'info',
+          text: `${result.cached ? 'Reopened cached' : 'Opened'} ${result.entryName} from ${archive.fileName}.`,
+        })
+      } catch (error) {
+        setStatus({
+          tone: 'error',
+          text: error instanceof Error ? error.message : 'Could not open this nested archive.',
+        })
+      } finally {
+        setBusy(null)
+      }
+    },
+    [
+      archive,
+      busy,
+      currentPath,
+      editingFile,
+      imagePreview,
+      navigation,
+      nestedInfo,
+      nestedModified,
+      scsEdits,
+      scsModPath,
+      scsSavedEdits,
+      selected,
+    ],
+  )
+
   const openRow = useCallback(
     (row: Row) => {
       if (row.type === 'folder') {
-        setCurrentPath(row.key)
-        setSelected(new Set())
-        lastClickIndex.current = null
+        navigateToFolder(row.key)
         return
       }
       if (row.type === 'container') {
         setStatus({
           tone: 'info',
-          text: 'HashFS .scs containers are read-only. Extract files to edit them.',
+          text: "This HashFS archive can't be browsed. It may use an unsupported HashFS version or be protected by its author. Try Extract To; if that fails, OpenZip can't open this file.",
         })
+        return
+      }
+
+      if (isNestedArchiveEntry(row.key)) {
+        void openNestedArchive(row.key)
         return
       }
 
@@ -1056,24 +2417,20 @@ function App() {
       }
 
       if (!isEditableFile(row.key)) {
+        const extension = fileExtension(row.key)
         setStatus({
           tone: 'info',
-          text: 'This file type cannot be opened in the built-in editor.',
+          text: BINARY_EXTENSIONS.has(extension)
+            ? `Binary game asset (.${extension}) — extract it to inspect or replace it.`
+            : 'This file type cannot be opened in the built-in editor.',
         })
         return
       }
 
       void handleOpenFile(row.key)
     },
-    [handleOpenFile, handleOpenImage],
+    [handleOpenFile, handleOpenImage, navigateToFolder, openNestedArchive],
   )
-
-  const goUp = useCallback(() => {
-    if (!currentPath) return
-    setCurrentPath(parentPath(currentPath))
-    setSelected(new Set())
-    lastClickIndex.current = null
-  }, [currentPath])
 
   /* ----- keyboard shortcuts ----- */
 
@@ -1109,33 +2466,102 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [editingFile, handleSaveFile])
 
-  // Esc closes the image viewer.
+  // Windows Explorer navigation shortcuts.
   useEffect(() => {
-    if (!imagePreview) return
-
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      const key = event.key
+
+      if (event.altKey && key === 'ArrowLeft') {
         event.preventDefault()
-        setImagePreview(null)
-        setStatus({ tone: 'info', text: 'Image closed' })
+        handleNavigateBack()
+        return
+      }
+      if (event.altKey && key === 'ArrowRight') {
+        event.preventDefault()
+        handleNavigateForward()
+        return
+      }
+      if (event.altKey && key === 'ArrowUp') {
+        event.preventDefault()
+        handleNavigateUp()
+        return
+      }
+      if (key === 'F5') {
+        event.preventDefault()
+        void refreshArchive()
+        return
+      }
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        key.toLowerCase() === 'a' &&
+        archive &&
+        !editingFile &&
+        !imagePreview
+      ) {
+        const target = event.target as HTMLElement | null
+        const isTextTarget = Boolean(
+          target &&
+            (target.tagName === 'INPUT' ||
+              target.tagName === 'TEXTAREA' ||
+              target.isContentEditable ||
+              target.closest('.monaco-editor')),
+        )
+        if (!isTextTarget) {
+          event.preventDefault()
+          selectAllRef.current = true
+          setSelected(new Set(rows.map((row) => row.key)))
+          lastClickIndex.current = null
+          setStatus({
+            tone: 'info',
+            text: `Selected ${rows.length} item${rows.length === 1 ? '' : 's'}`,
+          })
+          return
+        }
+      }
+      if (key === 'Escape' && (editingFile || imagePreview)) {
+        event.preventDefault()
+        event.stopPropagation()
+        handleNavigateBack()
+        return
+      }
+      if (key === 'Backspace') {
+        const target = event.target as HTMLElement | null
+        const isTextTarget = Boolean(
+          target &&
+            (target.tagName === 'INPUT' ||
+              target.tagName === 'TEXTAREA' ||
+              target.isContentEditable ||
+              target.closest('.monaco-editor')),
+        )
+        if (!isTextTarget) {
+          event.preventDefault()
+          handleNavigateBack()
+        }
       }
     }
 
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [imagePreview])
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [
+    archive,
+    editingFile,
+    handleNavigateBack,
+    handleNavigateForward,
+    handleNavigateUp,
+    imagePreview,
+    refreshArchive,
+    rows,
+  ])
 
   /* ----- render helpers ----- */
 
   const crumbs = splitPath(currentPath)
   const isMacStyle = false
   const progressPercent = progress?.percent ?? null
-  const extracting = busy === 'extracting'
+  const extracting = busy === 'extracting' || busy === 'nested'
   const currentFolderSize = rows.reduce((sum, row) => sum + row.size, 0)
-
-  const isScsContainer = Boolean(
-    archive && archive.entries.length === 1 && archive.entries[0].kind === 'container',
-  )
+  const activeEditName = editingFile?.name ?? null
+  const activeEditDirty = editingFile?.isDirty ?? false
 
   const currentItemLabel = (() => {
     if (!archive) return 'No archive open'
@@ -1161,6 +2587,7 @@ function App() {
           </span>
           <span className="brand-name">OpenZip</span>
           <span className="brand-sub">archive manager</span>
+          {appVersion && <span className="brand-version">{appVersion}</span>}
         </div>
         <div className="titlebar-right">
           {archive && (
@@ -1205,19 +2632,6 @@ function App() {
           <span>Close</span>
         </button>
 
-        <div className="toolbar-sep" />
-
-        <button
-          type="button"
-          className="tool-btn icon-only"
-          onClick={goUp}
-          disabled={!archive || !currentPath || busy !== null}
-          title="Up one level"
-          aria-label="Up one level"
-        >
-          <ArrowUp size={16} />
-        </button>
-
         <div className="toolbar-spacer" />
 
         <span className="toolbar-hint">
@@ -1225,16 +2639,63 @@ function App() {
         </span>
       </div>
 
-      {/* Address bar */}
+      {/* Explorer-style navigation + address bar */}
       <div className="addressbar">
+        <div className="nav-controls" role="group" aria-label="Navigation">
+          <button
+            type="button"
+            className="nav-btn"
+            onClick={handleNavigateBack}
+            disabled={!canNavigateBack}
+            title="Back (Alt+Left / Backspace)"
+            aria-label="Back"
+          >
+            <ArrowLeft size={16} />
+          </button>
+          <button
+            type="button"
+            className="nav-btn"
+            onClick={handleNavigateForward}
+            disabled={!canNavigateForward}
+            title="Forward (Alt+Right)"
+            aria-label="Forward"
+          >
+            <ArrowRight size={16} />
+          </button>
+          <button
+            type="button"
+            className="nav-btn"
+            onClick={handleNavigateUp}
+            disabled={!canNavigateUp}
+            title="Up one level (Alt+Up)"
+            aria-label="Up one level"
+          >
+            <ArrowUp size={16} />
+          </button>
+          <button
+            type="button"
+            className="nav-btn"
+            onClick={() => void refreshArchive()}
+            disabled={!archive || busy !== null}
+            title="Refresh (F5)"
+            aria-label="Refresh archive"
+          >
+            <RotateCw size={15} />
+          </button>
+        </div>
+
         <HardDrive size={15} className="address-icon" />
         <input
           className="address-input"
           type="text"
           readOnly
           spellCheck={false}
-          value={archive ? archive.filePath : 'Open a .zip, .rar, .7z, .iso, .tar, .gz or .scs archive'}
-          title={archive ? archive.filePath : undefined}
+          value={
+            archive
+              ? archiveChainLabel
+              : 'Open a .zip, .rar, .7z, .iso, .tar, .gz or .scs archive'
+          }
+          title={archive ? `${archiveChainLabel}\n${archive.filePath}` : undefined}
           aria-label="Current archive path"
         />
         {archive && (
@@ -1244,6 +2705,25 @@ function App() {
         )}
       </div>
 
+      {isNestedArchive && (
+        <div
+          className={`banner-warn ${
+            nestedWriteBlocked ? 'nested-readonly' : 'nested-editable'
+          }`}
+        >
+          <AlertCircle size={15} />
+          <span>
+            {nestedWriteBlocked
+              ? nestedReadOnlyMessage
+              : nestedModified
+                ? `Modified — save changes to ${archive?.fileName ?? 'this archive'} inside ${
+                    archiveStack[archiveStack.length - 1]?.archive.fileName ?? 'the outer archive'
+                  } before leaving.`
+                : `Editing inside ${archive?.fileName ?? 'this archive'}; changes are written back to the outer archive when you leave.`}
+          </span>
+        </div>
+      )}
+
       {/* Folder breadcrumbs (hidden while editing) */}
       {!editingFile && (
         <div className="breadcrumbs">
@@ -1252,10 +2732,7 @@ function App() {
             <button
               type="button"
               className={`crumb${currentPath ? '' : ' active'}`}
-              onClick={() => {
-                setCurrentPath('')
-                setSelected(new Set())
-              }}
+              onClick={() => navigateToFolder('')}
               disabled={busy !== null}
             >
               <PackageOpen size={13} />
@@ -1270,10 +2747,7 @@ function App() {
                   <button
                     type="button"
                     className={`crumb${isLast ? ' active' : ''}`}
-                    onClick={() => {
-                      setCurrentPath(target)
-                      setSelected(new Set())
-                    }}
+                    onClick={() => navigateToFolder(target)}
                     disabled={busy !== null}
                   >
                     {crumb}
@@ -1332,15 +2806,73 @@ function App() {
               )}
               <div className="editor-topbar-spacer" />
               <span className="editor-language">{editorLanguageLabel(editingFile.name)}</span>
+              {isHashFsArchive && (
+                <>
+                  <button
+                    type="button"
+                    className="editor-btn mod-target"
+                    onClick={() => void handleChangeScsModTarget()}
+                    disabled={nestedWriteBlocked || isSavingFile || busy !== null}
+                    title={
+                      nestedWriteBlocked
+                        ? nestedReadOnlyMessage
+                        : scsModPath ?? 'Choose where edited files are saved'
+                    }
+                  >
+                    <FolderOpen size={13} />
+                    <span>{scsModPath ? baseName(scsModPath) : 'Mod target…'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="editor-btn"
+                    onClick={() => void handleRevertScsEdit()}
+                    disabled={
+                      nestedWriteBlocked ||
+                      isSavingFile ||
+                      (!editingFile.isDirty && scsEdits[editingFile.name] === undefined)
+                    }
+                    title={
+                      nestedWriteBlocked
+                        ? nestedReadOnlyMessage
+                        : 'Revert this file to the original archive contents'
+                    }
+                  >
+                    <RotateCcw size={13} />
+                    <span>Revert</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="editor-btn"
+                    onClick={() => void handleSaveScsCopy()}
+                    disabled={nestedWriteBlocked || isSavingFile || busy !== null}
+                    title={
+                      nestedWriteBlocked
+                        ? nestedReadOnlyMessage
+                        : 'Save a modified copy of the entire HashFS archive'
+                    }
+                  >
+                    <FileOutput size={13} />
+                    <span>Modified Copy…</span>
+                  </button>
+                </>
+              )}
               <button
                 type="button"
                 className="editor-btn save"
                 onClick={() => void handleSaveFile()}
-                disabled={isSavingFile || !editingFile.isDirty}
-                title="Save to Archive (Ctrl+S)"
+                disabled={nestedWriteBlocked || isSavingFile || !editingFile.isDirty}
+                title={
+                  nestedWriteBlocked
+                    ? nestedReadOnlyMessage
+                    : isHashFsArchive
+                      ? 'Save to Mod (Ctrl+S)'
+                      : 'Save to Archive (Ctrl+S)'
+                }
               >
                 {isSavingFile ? <Loader2 size={14} className="spin" /> : <Save size={14} />}
-                <span>{isSavingFile ? 'Saving…' : 'Save to Archive'}</span>
+                <span>
+                  {isSavingFile ? 'Saving…' : isHashFsArchive ? 'Save to Mod' : 'Save to Archive'}
+                </span>
               </button>
               <button
                 type="button"
@@ -1461,7 +2993,7 @@ function App() {
               </thead>
               <tbody>
                 {currentPath && (
-                  <tr className="row up-row" onDoubleClick={goUp}>
+                  <tr className="row up-row" onDoubleClick={handleNavigateUp}>
                     <td className="cell-name" colSpan={4}>
                       <span className="row-icon folder">
                         <ArrowUp size={15} />
@@ -1481,12 +3013,19 @@ function App() {
                 {rows.map((row, index) => {
                   const isSelected = selected.has(row.key)
                   const rowIsImage = row.type === 'file' && isImageFile(row.key)
+                  const rowIsEdited =
+                    Boolean(scsEdits[row.key]) ||
+                    Boolean(activeEditName === row.key && activeEditDirty)
                   return (
                     <tr
                       key={row.key}
                       className={`row${isSelected ? ' selected' : ''}${
                         row.type === 'folder' ? ' is-folder' : ''
-                      }`}
+                      }${rowIsEdited ? ' is-edited' : ''}`}
+                      draggable={Boolean(archive) && !busy && row.type !== 'container'}
+                      onDragStart={(event) => handleRowDragStart(event, row)}
+                      onDragEnd={handleRowDragEnd}
+                      onMouseDown={(event) => handleRowMouseDown(event, row)}
                       onClick={(event) => handleSelect(row, index, event)}
                       onDoubleClick={() => openRow(row)}
                       title={row.type === 'container' ? 'HashFS container' : row.key}
@@ -1517,6 +3056,7 @@ function App() {
                         {row.type === 'folder' && <span className="row-note">Folder</span>}
                         {row.type === 'container' && <span className="row-note">HashFS archive</span>}
                         {rowIsImage && <span className="row-note">Image</span>}
+                        {rowIsEdited && <span className="row-note edited">Edited</span>}
                       </td>
                       <td className="numeric cell-size">{formatBytes(row.size)}</td>
                       <td className="numeric cell-size muted">{formatBytes(row.packed)}</td>
@@ -1571,6 +3111,9 @@ function App() {
           <span className="status-stat dim">
             {selected.size > 0 ? `${selected.size} selected` : 'no selection'}
           </span>
+          {scsEditedCount > 0 && (
+            <span className="status-stat edited">{scsEditedCount} edited</span>
+          )}
           <span className="status-stat dim">{currentItemLabel}</span>
         </div>
       </footer>
@@ -1618,8 +3161,7 @@ function App() {
           className="image-modal-backdrop"
           role="presentation"
           onMouseDown={() => {
-            setImagePreview(null)
-            setStatus({ tone: 'info', text: 'Image closed' })
+            handleNavigateBack()
           }}
         >
           <div
@@ -1641,8 +3183,7 @@ function App() {
                 type="button"
                 className="editor-btn"
                 onClick={() => {
-                  setImagePreview(null)
-                  setStatus({ tone: 'info', text: 'Image closed' })
+                  handleNavigateBack()
                 }}
               >
                 <X size={14} />

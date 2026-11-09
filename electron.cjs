@@ -12,10 +12,18 @@
  *    bundled SCS extractor instead
  */
 
-const { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, nativeImage, nativeTheme, shell } = require('electron');
+const {
+  readHashFsIndex,
+  readHashFsEntry,
+  writeHashFsCopy,
+} = require('./scs-hashfs.cjs');
+const { sweepStaleTempFolders } = require('./temp-cleanup.cjs');
+const { createSettingsStore } = require('./app-settings.cjs');
 const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
+const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const os = require('node:os');
 const Seven = require('node-7z');
@@ -84,7 +92,41 @@ const SEVEN_ZIP_NAMES = ['7z.exe', '7z'];
  * progress bar. Entries are bounded by the archive's own listing.
  */
 const archiveMetaCache = new Map();
+const scsIndexCache = new Map();
+const dragSessions = new Map();
+const dragRoots = new Set();
+const DRAG_ROOT_PREFIX = 'openzip-drag-';
+const DRAG_SESSION_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
+const DRAG_AUTO_PREP_LIMIT_BYTES = 200 * 1024 * 1024;
+const DRAG_SESSION_PRUNE_LIMIT_BYTES = 512 * 1024 * 1024;
+const NESTED_ROOT_PREFIX = 'openzip-nested-';
+const NESTED_CONFIRM_BYTES = 300 * 1024 * 1024;
+const NESTED_ARCHIVE_EXTENSIONS = new Set(['scs', 'zip', 'rar', '7z', 'tar', 'iso', 'cab']);
+const NESTED_WRITABLE_FORMATS = new Set(['zip', '7z', 'tar']);
+const NESTED_READ_ONLY_ERROR =
+  'This archive is opened from inside another archive. Extract it to edit it.';
+const nestedArchiveCache = new Map();
+const nestedRoots = new Set();
 
+let appSettings = null;
+function getAppSettings() {
+  if (!appSettings) {
+    appSettings = createSettingsStore({ userDataPath: app.getPath('userData') });
+    appSettings.load();
+  }
+  return appSettings;
+}
+
+function rememberArchiveFolder(filePath) {
+  if (!filePath || isNestedArchivePath(filePath)) return;
+  try {
+    getAppSettings().set('lastOpenDir', path.dirname(path.resolve(filePath)));
+  } catch {
+    /* settings are best effort */
+  }
+}
+const DRAG_ICON_FALLBACK =
+  'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAOklEQVR42u3OMQEAAAgDoJnc/9CtwQ8FkGx3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4G8GmQABAVX0ZQAAAABJRU5ErkJggg==';
 let mainWindow = null;
 let cachedSevenBinary = null;
 
@@ -117,6 +159,21 @@ nativeTheme.on('updated', () => {
 /* Window                                                              */
 /* ------------------------------------------------------------------ */
 
+function resolveWindowIcon() {
+  const roots = [];
+  if (app.isPackaged) {
+    roots.push(path.join(process.resourcesPath, 'app.asar.unpacked'));
+  }
+  roots.push(__dirname, app.getAppPath());
+  for (const extension of ['ico', 'png']) {
+    for (const root of roots) {
+      const candidate = path.join(root, 'docs', `icon.${extension}`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 950,
@@ -124,6 +181,7 @@ function createWindow() {
     minWidth: 780,
     minHeight: 480,
     title: 'OpenZip',
+    icon: resolveWindowIcon(),
     backgroundColor: themeBackground(),
     autoHideMenuBar: true,
     show: false,
@@ -493,7 +551,13 @@ async function readArchiveEntryBuffer(archivePath, entryName, maxBytes = MAX_EDI
   const magic = await readMagic(archivePath);
 
   if (isScsMagic(magic)) {
-    throw new Error('HashFS .scs containers cannot be opened in place.');
+    const index = readScsIndex(archivePath, stat);
+    if (!index.supported) {
+      throw new Error(
+        `This HashFS archive cannot be read natively (${index.reason || 'unsupported variant'}). Extract it with the SCS extractor.`,
+      );
+    }
+    return readHashFsEntry(index, name, maxBytes);
   }
 
   return isZipMagic(magic)
@@ -639,6 +703,7 @@ async function refreshArchiveCacheAfterSave(archivePath, entryName, bytes) {
 }
 
 async function saveArchiveEntry(archivePath, entryName, newContent) {
+  await ensureNestedWritable(archivePath);
   if (!archivePath) throw new Error('No archive is open.');
   if (typeof newContent !== 'string') throw new Error('No file content was provided.');
 
@@ -654,7 +719,7 @@ async function saveArchiveEntry(archivePath, entryName, newContent) {
   const magic = await readMagic(archivePath);
 
   if (isScsMagic(magic)) {
-    throw new Error('HashFS .scs containers cannot be edited in place. Extract the files and repack the mod.');
+    throw new Error('HashFS edits are saved through the mod package workflow; use Save to Mod.');
   }
 
   if (isZipMagic(magic)) {
@@ -675,6 +740,142 @@ async function saveArchiveEntry(archivePath, entryName, newContent) {
 
   await saveSevenZipEntry(archivePath, name, newContent);
   await refreshArchiveCacheAfterSave(archivePath, name, bytes);
+}
+
+/* ------------------------------------------------------------------ */
+/* HashFS edit output                                                  */
+/* ------------------------------------------------------------------ */
+
+function samePath(a, b) {
+  return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+}
+
+async function saveScsMod({ archivePath, modPath, files }) {
+  await ensureNestedWritable(archivePath);
+  if (!archivePath || !modPath) throw new Error('No mod target was selected.');
+  if (!Array.isArray(files)) throw new Error('No edited files were provided.');
+  if (samePath(archivePath, modPath)) {
+    throw new Error('The mod package must use a different path from the original archive.');
+  }
+
+  const stat = await fsp.stat(archivePath).catch(() => null);
+  if (!stat || !stat.isFile()) throw new Error('Archive no longer exists.');
+  const magic = await readMagic(archivePath);
+  if (!isScsMagic(magic)) throw new Error('This save mode is only for HashFS .scs archives.');
+
+  const zip = new AdmZip();
+  const written = [];
+  for (const item of files) {
+    const entryName = normalizeEntryName(item && item.entryName);
+    if (typeof item.content !== 'string') throw new Error(`No text was provided for ${entryName}.`);
+    if (Buffer.byteLength(item.content, 'utf8') > MAX_EDITABLE_BYTES) {
+      throw new Error(`${entryName} is too large to save.`);
+    }
+    zip.addFile(entryName, Buffer.from(item.content, 'utf8'));
+    written.push(entryName);
+  }
+
+  await fsp.mkdir(path.dirname(modPath), { recursive: true });
+  await writeZipAtomically(zip, modPath);
+  return { success: true, fileCount: written.length, path: modPath, files: written };
+}
+
+async function saveScsModifiedCopy({ archivePath, outputPath, files }) {
+  await ensureNestedWritable(archivePath);
+  if (!archivePath || !outputPath) throw new Error('No output path was selected.');
+  if (!Array.isArray(files) || files.length === 0) throw new Error('No edited files were provided.');
+  if (samePath(archivePath, outputPath)) {
+    throw new Error('The modified copy must use a different path from the original archive.');
+  }
+
+  const stat = await fsp.stat(archivePath).catch(() => null);
+  if (!stat || !stat.isFile()) throw new Error('Archive no longer exists.');
+  const magic = await readMagic(archivePath);
+  if (!isScsMagic(magic)) throw new Error('This save mode is only for HashFS .scs archives.');
+
+  const edits = new Map();
+  for (const item of files) {
+    const entryName = normalizeEntryName(item && item.entryName);
+    if (typeof item.content !== 'string') throw new Error(`No text was provided for ${entryName}.`);
+    if (Buffer.byteLength(item.content, 'utf8') > MAX_EDITABLE_BYTES) {
+      throw new Error(`${entryName} is too large to save.`);
+    }
+    edits.set(entryName, Buffer.from(item.content, 'utf8'));
+  }
+
+  sendProgress({
+    format: 'scs',
+    phase: 'writing',
+    percent: 0,
+    done: null,
+    total: null,
+    entry: '',
+    message: 'Preparing modified HashFS copy…',
+  });
+
+  const result = await writeHashFsCopy(archivePath, outputPath, edits, {
+    onProgress: ({ percent, message }) => {
+      sendProgress({
+        format: 'scs',
+        phase: 'writing',
+        percent,
+        done: null,
+        total: null,
+        entry: '',
+        message,
+      });
+    },
+  });
+
+  sendProgress({
+    format: 'scs',
+    phase: 'done',
+    percent: 100,
+    done: result.edited.length,
+    total: result.edited.length,
+    entry: '',
+    message: 'Modified copy written',
+  });
+
+  return { success: true, ...result };
+}
+
+async function chooseScsPath({ archivePath, mode }) {
+  const baseName = path.basename(archivePath, path.extname(archivePath));
+  const suffix = mode === 'copy' ? '_modified.scs' : '_mod.scs';
+  let defaultPath;
+
+  if (mode === 'copy') {
+    defaultPath = path.join(path.dirname(archivePath), `${baseName}${suffix}`);
+  } else {
+    const modDir = path.join(app.getPath('documents'), 'OpenZip Mods');
+    await fsp.mkdir(modDir, { recursive: true }).catch(() => {});
+    defaultPath = path.join(modDir, `${baseName}${suffix}`);
+  }
+
+  const options = {
+    title:
+      mode === 'copy'
+        ? 'Save a modified copy of the HashFS archive'
+        : 'Save HashFS edits as a mod package',
+    defaultPath,
+    filters: [
+      { name: 'SCS / ZIP mod package', extensions: ['scs', 'zip'] },
+      { name: 'All files', extensions: ['*'] },
+    ],
+  };
+
+  const result = mainWindow
+    ? await dialog.showSaveDialog(mainWindow, options)
+    : await dialog.showSaveDialog(options);
+  if (result.canceled || !result.filePath) return { canceled: true, filePath: null };
+
+  let target = result.filePath;
+  if (!/\.(scs|zip)$/i.test(target)) target += '.scs';
+  if (samePath(archivePath, target)) {
+    throw new Error('Choose a different path; the original archive is never overwritten.');
+  }
+  return { canceled: false, filePath: target };
 }
 
 /* ------------------------------------------------------------------ */
@@ -813,7 +1014,13 @@ async function addFilesToSevenZip(archivePath, sources, targetDir) {
   }
 }
 
-async function addFilesToArchive({ archivePath, filePaths, targetDir }) {
+async function addFilesToArchive({
+  archivePath,
+  filePaths,
+  targetDir,
+  allowNestedWrite = false,
+}) {
+  if (!allowNestedWrite) await ensureNestedWritable(archivePath);
   if (!archivePath) throw new Error('No archive is open.');
   if (!Array.isArray(filePaths) || filePaths.length === 0) {
     throw new Error('No files were dropped.');
@@ -1005,9 +1212,51 @@ async function readWithSevenZip(filePath) {
   };
 }
 
+function readScsIndex(filePath, stat) {
+  const cached = scsIndexCache.get(filePath);
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.index;
+
+  let index;
+  try {
+    index = readHashFsIndex(filePath);
+  } catch (error) {
+    index = { supported: false, reason: error.message || String(error) };
+  }
+  scsIndexCache.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, index });
+  return index;
+}
+
 function readScs(filePath, fileName, stat) {
-  // HashFS archives are opaque: they are exposed as one extractable container
-  // and unpacked by the bundled SCS extractor executable.
+  const index = readScsIndex(filePath, stat);
+  if (index.supported && index.files.length > 0) {
+    const folders = Math.max(0, index.directories.length - 1);
+    const entries = index.files.map((file) => ({
+      name: file.name,
+      size: file.size,
+      compressedSize: file.packedSize,
+      isDirectory: false,
+      time: null,
+      kind: 'file',
+      encrypted: false,
+    }));
+
+    return {
+      format: 'scs',
+      entries,
+      stats: {
+        fileCount: entries.length,
+        folderCount: folders,
+        totalSize: entries.reduce((sum, entry) => sum + entry.size, 0),
+        totalPackedSize: entries.reduce((sum, entry) => sum + (entry.compressedSize ?? 0), 0),
+      },
+      note:
+        'HashFS v2 archive read natively. Edits are saved to a separate mod package; ' +
+        'the original game archive is never modified.',
+    };
+  }
+
+  // Unsupported HashFS variant or missing directory tree: expose a single
+  // container entry so the existing SCS extractor path still works.
   const container = {
     name: fileName,
     size: stat.size,
@@ -1027,6 +1276,9 @@ function readScs(filePath, fileName, stat) {
       totalSize: stat.size,
       totalPackedSize: stat.size,
     },
+    note: index.reason
+      ? `HashFS archive could not be fully indexed (${index.reason}). It may be an unsupported version or protected by its author; try Extract To.`
+      : "HashFS archive could not be fully indexed. It may be an unsupported version or protected by its author; try Extract To.",
   };
 }
 
@@ -1392,7 +1644,7 @@ async function extractArchive({ filePath, outputDir, entries }) {
   const toolPath = resolveScsExtractor();
   if (!toolPath) {
     throw new Error(
-      'The bundled SCS extractor (bin/extractor.exe) is missing. Reinstall OpenZip with its bin folder.',
+      'The bundled SCS extractor (bin/scs_extractor.exe) is missing. Reinstall OpenZip with its bin folder.',
     );
   }
 
@@ -1420,11 +1672,974 @@ async function extractArchive({ filePath, outputDir, entries }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Drag-out preparation                                                */
+/* ------------------------------------------------------------------ */
+
+function dragRootFor(sessionId) {
+  if (typeof sessionId !== 'string' || !DRAG_SESSION_PATTERN.test(sessionId)) {
+    throw new Error('Invalid drag session identifier.');
+  }
+  const tempRoot = path.resolve(os.tmpdir());
+  const root = path.resolve(path.join(tempRoot, `${DRAG_ROOT_PREFIX}${sessionId}`));
+  if (path.dirname(root) !== tempRoot || !path.basename(root).startsWith(DRAG_ROOT_PREFIX)) {
+    throw new Error('Invalid drag temporary folder.');
+  }
+  return root;
+}
+
+function normalizeDragRoot(rootName) {
+  if (typeof rootName !== 'string') throw new Error('Invalid selected entry.');
+  const isDirectory = rootName.endsWith('/');
+  const normalized = normalizeEntryName(isDirectory ? rootName.slice(0, -1) : rootName);
+  return isDirectory ? `${normalized}/` : normalized;
+}
+
+function dragSignature(roots, entries) {
+  return JSON.stringify({
+    roots: [...new Set(roots)].sort(),
+    entries: [...new Set(entries)].sort(),
+  });
+}
+
+function safeDragPath(root, entryName) {
+  const normalized = normalizeEntryName(entryName);
+  const rootResolved = path.resolve(root);
+  const resolved = path.resolve(rootResolved, ...normalized.split('/'));
+  if (resolved !== rootResolved && !resolved.startsWith(`${rootResolved}${path.sep}`)) {
+    throw new Error('Archive entry would escape the drag temporary folder.');
+  }
+  return resolved;
+}
+
+async function verifyDragTree(root) {
+  const rootResolved = path.resolve(root);
+  const stack = [rootResolved];
+  let visited = 0;
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    visited += 1;
+    if (visited > 250_000) throw new Error('Extracted selection is too large to drag.');
+
+    const records = await fsp.readdir(current, { withFileTypes: true });
+    for (const record of records) {
+      const fullPath = path.join(current, record.name);
+      const resolved = path.resolve(fullPath);
+      if (!resolved.startsWith(`${rootResolved}${path.sep}`)) {
+        throw new Error('Extraction escaped the drag temporary folder.');
+      }
+      if (record.isSymbolicLink()) {
+        throw new Error('Symbolic links cannot be dragged out safely.');
+      }
+      if (record.isDirectory()) stack.push(resolved);
+    }
+  }
+}
+
+function dragIcon() {
+  const candidates = app.isPackaged
+    ? [
+        path.join(process.resourcesPath, 'app.asar.unpacked', 'docs', 'icon.png'),
+        path.join(app.getAppPath(), 'docs', 'icon.png'),
+      ]
+    : [path.join(__dirname, 'docs', 'icon.png'), path.join(__dirname, 'docs', 'icon.ico')];
+
+  for (const candidate of candidates) {
+    try {
+      const icon = nativeImage.createFromPath(candidate);
+      if (!icon.isEmpty()) return icon;
+    } catch {
+      /* try the next candidate */
+    }
+  }
+
+  return nativeImage.createFromBuffer(Buffer.from(DRAG_ICON_FALLBACK, 'base64'));
+}
+
+async function extractScsDragSelection(filePath, outputDir, entries, stat) {
+  const toolPath = resolveScsExtractor();
+  if (!toolPath) {
+    throw new Error(
+      'The bundled SCS extractor (bin/scs_extractor.exe) is missing. Reinstall OpenZip with its bin folder.',
+    );
+  }
+
+  const profile = await probeScsToolProfile(toolPath);
+  if (profile === 'modern') {
+    const listPath = path.join(outputDir, '.openzip-drag-selection.txt');
+    await fsp.writeFile(listPath, entries.map((entry) => `/${entry}`).join('\n'), 'utf8');
+    try {
+      await extractScsWithTool(toolPath, filePath, outputDir, profile, [`--paths=${listPath}`]);
+    } finally {
+      await fsp.rm(listPath, { force: true }).catch(() => {});
+    }
+    return;
+  }
+
+  // Legacy extractor: prefer native HashFS reads when the archive is v2.
+  const index = readScsIndex(filePath, stat);
+  if (index.supported) {
+    const extracted = [];
+    for (const entryName of entries) {
+      const file = index.filesByPath.get(entryName);
+      if (!file || file.packedImage) continue;
+      const destination = safeDragPath(outputDir, entryName);
+      await fsp.mkdir(path.dirname(destination), { recursive: true });
+      await fsp.writeFile(destination, readHashFsEntry(index, entryName, Number.MAX_SAFE_INTEGER));
+      extracted.push(entryName);
+    }
+    if (extracted.length === 0) throw new Error('None of the selected files could be read.');
+    return;
+  }
+
+  await extractScsWithTool(toolPath, filePath, outputDir, profile);
+}
+
+async function extractDragEntries(archivePath, outputDir, entries) {
+  const stat = await fsp.stat(archivePath).catch(() => null);
+  if (!stat || !stat.isFile()) throw new Error('Archive no longer exists.');
+
+  const magic = await readMagic(archivePath);
+  const meta = cachedMetaFor(archivePath, stat);
+  const treatAsScs = isScsMagic(magic) || (meta && meta.format === 'scs');
+
+  await ensureDirectory(outputDir);
+
+  if (treatAsScs) {
+    await extractScsDragSelection(archivePath, outputDir, entries, stat);
+    return;
+  }
+
+  await extractWithSevenZip({
+    filePath: archivePath,
+    outputDir,
+    selectedEntries: entries,
+    format: (meta && meta.format) || extensionOf(archivePath) || 'archive',
+    meta,
+  });
+}
+
+function buildDragItems(root, roots, entries) {
+  const folderRoots = roots.filter((rootName) => rootName.endsWith('/'));
+  const fileRoots = roots.filter((rootName) => !rootName.endsWith('/'));
+  const folderNames = folderRoots.map((rootName) => rootName.slice(0, -1));
+  const candidates = [];
+
+  const isInsideSelectedFolder = (name) =>
+    folderNames.some((folder) => name === folder || name.startsWith(`${folder}/`));
+
+  for (const folder of folderNames) {
+    const absolute = safeDragPath(root, folder);
+    const stat = fs.statSync(absolute, { throwIfNoEntry: false });
+    if (stat && stat.isDirectory()) candidates.push(absolute);
+  }
+
+  for (const file of fileRoots) {
+    if (isInsideSelectedFolder(file)) continue;
+    const absolute = safeDragPath(root, file);
+    if (fs.existsSync(absolute)) candidates.push(absolute);
+  }
+
+  if (roots.length === 0) {
+    for (const entry of entries) {
+      const absolute = safeDragPath(root, entry);
+      if (fs.existsSync(absolute)) candidates.push(absolute);
+    }
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(candidate);
+  }
+  return unique;
+}
+
+async function prepareDrag({
+  sessionId,
+  archivePath,
+  roots,
+  entries,
+  automatic = false,
+  selectionBytes = 0,
+}) {
+  if (!archivePath) throw new Error('No archive is open.');
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error('Select at least one file or folder to drag.');
+  }
+
+  const archiveStat = await fsp.stat(archivePath).catch(() => null);
+  if (!archiveStat || !archiveStat.isFile()) throw new Error('Archive no longer exists.');
+
+  if (automatic) {
+    const bytes = Number(selectionBytes);
+    if (!Number.isFinite(bytes) || bytes > DRAG_AUTO_PREP_LIMIT_BYTES) {
+      return {
+        success: false,
+        skipped: true,
+        error: `Automatic preparation is limited to ${Math.round(
+          DRAG_AUTO_PREP_LIMIT_BYTES / 1024 / 1024,
+        )} MB. Drag again to prepare the selection manually.`,
+      };
+    }
+  }
+
+  const normalizedEntries = [...new Set(entries.map(normalizeEntryName))];
+  const rootList = Array.isArray(roots) ? roots : [];
+  const normalizedRoots = [...new Set(rootList.map(normalizeDragRoot))];
+  const root = dragRootFor(sessionId);
+  const signature = dragSignature(normalizedRoots, normalizedEntries);
+
+  let session = dragSessions.get(sessionId);
+  if (!session) {
+    session = {
+      root,
+      archivePath,
+      chain: Promise.resolve(),
+      requestId: 0,
+      ready: false,
+      signature: null,
+      items: [],
+      closed: false,
+      presentEntries: new Map(),
+      extractedBytes: 0,
+      archiveSize: archiveStat.size,
+      archiveMtimeMs: archiveStat.mtimeMs,
+      needsExtractReset: false,
+    };
+    dragSessions.set(sessionId, session);
+    dragRoots.add(root);
+  }
+
+  if (session.archivePath !== archivePath) {
+    throw new Error('The drag session does not belong to this archive.');
+  }
+
+  const archiveChanged =
+    session.archiveSize !== archiveStat.size || session.archiveMtimeMs !== archiveStat.mtimeMs;
+  session.archiveSize = archiveStat.size;
+  session.archiveMtimeMs = archiveStat.mtimeMs;
+  if (archiveChanged) {
+    session.presentEntries.clear();
+    session.extractedBytes = 0;
+    session.ready = false;
+    session.signature = null;
+    session.items = [];
+    session.needsExtractReset = true;
+  }
+
+  if (
+    session.ready &&
+    session.signature === signature &&
+    session.items.length > 0 &&
+    session.items.every((item) => fs.existsSync(item))
+  ) {
+    return {
+      success: true,
+      ready: true,
+      signature,
+      items: session.items,
+      tempDir: root,
+    };
+  }
+
+  session.ready = false;
+  const requestId = ++session.requestId;
+
+  const job = session.chain
+    .catch(() => {})
+    .then(async () => {
+      if (session.closed || requestId !== session.requestId) {
+        return { success: false, stale: true, error: 'Drag preparation superseded.' };
+      }
+
+      if (session.needsExtractReset) {
+        await fsp.rm(root, { recursive: true, force: true });
+        await fsp.mkdir(root, { recursive: true });
+        session.needsExtractReset = false;
+      } else {
+        await fsp.mkdir(root, { recursive: true });
+      }
+
+      // Drop records whose files vanished from the session folder.
+      for (const [entryName, record] of session.presentEntries) {
+        if (!fs.existsSync(record.path)) {
+          session.presentEntries.delete(entryName);
+          session.extractedBytes = Math.max(0, session.extractedBytes - record.size);
+        }
+      }
+
+      const missingEntries = normalizedEntries.filter((entryName) => {
+        const record = session.presentEntries.get(entryName);
+        return !record || !fs.existsSync(record.path);
+      });
+
+      try {
+        if (missingEntries.length > 0) {
+          await extractDragEntries(archivePath, root, missingEntries);
+        }
+        await verifyDragTree(root);
+
+        for (const entryName of normalizedEntries) {
+          const absolute = safeDragPath(root, entryName);
+          const stat = fs.statSync(absolute, { throwIfNoEntry: false });
+          if (!stat || !stat.isFile()) continue;
+          const existing = session.presentEntries.get(entryName);
+          if (existing) {
+            session.extractedBytes = Math.max(0, session.extractedBytes - existing.size);
+          }
+          session.presentEntries.set(entryName, { path: absolute, size: stat.size });
+          session.extractedBytes += stat.size;
+        }
+
+        if (session.closed || requestId !== session.requestId) {
+          return { success: false, stale: true, error: 'Drag preparation superseded.' };
+        }
+
+        // Retain already-extracted files while the session stays below the
+        // pruning threshold. Above it, drop entries no longer in the selection.
+        if (session.extractedBytes > DRAG_SESSION_PRUNE_LIMIT_BYTES) {
+          const selected = new Set(normalizedEntries);
+          for (const [entryName, record] of session.presentEntries) {
+            if (selected.has(entryName)) continue;
+            try {
+              fs.rmSync(record.path, { force: true });
+            } catch {
+              continue;
+            }
+            session.presentEntries.delete(entryName);
+            session.extractedBytes = Math.max(0, session.extractedBytes - record.size);
+          }
+        }
+
+        const items = buildDragItems(root, normalizedRoots, normalizedEntries);
+        if (items.length === 0) {
+          throw new Error('No selected files were extracted.');
+        }
+
+        session.ready = true;
+        session.signature = signature;
+        session.items = items;
+        return { success: true, ready: true, signature, items, tempDir: root };
+      } catch (error) {
+        session.ready = false;
+        return { success: false, error: error.message || String(error) };
+      }
+    });
+
+  session.chain = job;
+  return job;
+}
+
+function invalidateDragSessions(archivePath) {
+  if (!archivePath) return;
+  for (const session of dragSessions.values()) {
+    if (session.archivePath !== archivePath) continue;
+    session.presentEntries.clear();
+    session.extractedBytes = 0;
+    session.ready = false;
+    session.signature = null;
+    session.items = [];
+    session.archiveSize = null;
+    session.archiveMtimeMs = null;
+    session.needsExtractReset = true;
+    session.requestId += 1;
+  }
+}
+
+async function cleanupDragSession(sessionId) {
+  let root;
+  try {
+    root = dragRootFor(sessionId);
+  } catch {
+    return { success: false, error: 'Invalid drag session identifier.' };
+  }
+
+  const session = dragSessions.get(sessionId);
+  if (session) {
+    session.closed = true;
+    session.ready = false;
+    dragSessions.delete(sessionId);
+    await session.chain.catch(() => {});
+  }
+
+  await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+  dragRoots.delete(root);
+  return { success: true };
+}
+
+function cleanupAllDragRootsSync() {
+  const tempRoot = path.resolve(os.tmpdir());
+  const roots = new Set(dragRoots);
+  for (const session of dragSessions.values()) roots.add(session.root);
+  dragSessions.clear();
+  dragRoots.clear();
+
+  for (const root of roots) {
+    const resolved = path.resolve(root);
+    if (path.dirname(resolved) !== tempRoot) continue;
+    if (!path.basename(resolved).startsWith(DRAG_ROOT_PREFIX)) continue;
+    try {
+      fs.rmSync(resolved, { recursive: true, force: true });
+    } catch {
+      /* best effort during shutdown */
+    }
+  }
+}
+
+ipcMain.handle('archive:prepareDrag', async (_event, payload) => {
+  try {
+    return await prepareDrag(payload || {});
+  } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:cleanupDrag', async (_event, payload) => {
+  return cleanupDragSession((payload || {}).sessionId);
+});
+
+ipcMain.on('archive:startDrag', (event, payload) => {
+  try {
+    const { sessionId, signature } = payload || {};
+    const session = dragSessions.get(sessionId);
+    if (!session || !session.ready || session.signature !== signature) {
+      event.sender.send('archive:dragError', 'Files are not ready yet. Drag again once preparation finishes.');
+      return;
+    }
+
+    const items = session.items.filter((item) => fs.existsSync(item));
+    if (items.length === 0) {
+      event.sender.send('archive:dragError', 'The prepared files are no longer available.');
+      return;
+    }
+
+    const icon = dragIcon();
+    if (!icon || icon.isEmpty()) {
+      event.sender.send('archive:dragError', 'The drag icon could not be loaded.');
+      return;
+    }
+
+    const electronMajor = Number.parseInt(String(process.versions.electron).split('.')[0], 10);
+    const singleFile = items.length === 1 && fs.statSync(items[0]).isFile();
+    if (singleFile) {
+      event.sender.startDrag({ file: items[0], icon });
+    } else if (Number.isFinite(electronMajor) && electronMajor >= 30) {
+      event.sender.startDrag({ files: items, icon });
+    } else {
+      // Older Electron versions only accept one path: drag the extracted
+      // parent folder, which keeps the selected tree intact.
+      event.sender.startDrag({ file: session.root, icon });
+    }
+  } catch (error) {
+    try {
+      event.sender.send('archive:dragError', error.message || String(error));
+    } catch {
+      /* renderer already gone */
+    }
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Nested archive extraction                                           */
+/* ------------------------------------------------------------------ */
+
+function isNestedArchivePath(filePath) {
+  if (!filePath) return false;
+  const tempRoot = path.resolve(os.tmpdir());
+  const relative = path.relative(tempRoot, path.resolve(filePath));
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
+  const first = relative.split(path.sep)[0];
+  return first.startsWith(NESTED_ROOT_PREFIX);
+}
+
+function isManagedNestedRoot(root) {
+  const tempRoot = path.resolve(os.tmpdir());
+  const resolved = path.resolve(root);
+  return (
+    path.dirname(resolved) === tempRoot &&
+    path.basename(resolved).startsWith(NESTED_ROOT_PREFIX)
+  );
+}
+
+function nestedRootFor(sessionId) {
+  if (typeof sessionId !== 'string' || !DRAG_SESSION_PATTERN.test(sessionId)) {
+    throw new Error('Invalid nested archive session identifier.');
+  }
+  const root = path.resolve(os.tmpdir(), `${NESTED_ROOT_PREFIX}${sessionId}`);
+  if (!isManagedNestedRoot(root)) throw new Error('Invalid nested archive temporary folder.');
+  return root;
+}
+
+async function cleanupAllNestedArchives() {
+  const roots = new Set(nestedRoots);
+  for (const item of nestedArchiveCache.values()) roots.add(item.root);
+  nestedArchiveCache.clear();
+  nestedRoots.clear();
+
+  for (const root of roots) {
+    if (!isManagedNestedRoot(root)) continue;
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function cleanupAllNestedArchivesSync() {
+  const roots = new Set(nestedRoots);
+  for (const item of nestedArchiveCache.values()) roots.add(item.root);
+  nestedArchiveCache.clear();
+  nestedRoots.clear();
+
+  for (const root of roots) {
+    if (!isManagedNestedRoot(root)) continue;
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+function invalidateNestedArchives(archivePath) {
+  if (!archivePath) return;
+  const resolved = path.resolve(archivePath);
+  for (const [key, item] of nestedArchiveCache) {
+    if (path.resolve(item.outerArchivePath) !== resolved) continue;
+    nestedArchiveCache.delete(key);
+    nestedRoots.delete(item.root);
+    if (isManagedNestedRoot(item.root)) {
+      try {
+        fs.rmSync(item.root, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+}
+
+function nestedReadOnlyError(reason) {
+  return `${NESTED_READ_ONLY_ERROR} ${reason}`;
+}
+
+function isNestedWritableFormat(format) {
+  return NESTED_WRITABLE_FORMATS.has(format);
+}
+
+function findNestedCacheItem(filePath) {
+  const resolved = path.resolve(filePath);
+  for (const item of nestedArchiveCache.values()) {
+    if (path.resolve(item.filePath) === resolved) return item;
+  }
+  return null;
+}
+
+async function ensureNestedWritable(archivePath) {
+  if (!isNestedArchivePath(archivePath)) return;
+  const item = findNestedCacheItem(archivePath);
+  if (!item) {
+    throw new Error(nestedReadOnlyError('The nested session is no longer available.'));
+  }
+
+  const innerStat = await fsp.stat(archivePath).catch(() => null);
+  if (!innerStat || !innerStat.isFile()) {
+    throw new Error(nestedReadOnlyError('The inner archive is no longer available.'));
+  }
+  const innerParsed = await readArchive(
+    archivePath,
+    innerStat,
+    await readMagic(archivePath),
+  ).catch(() => null);
+  if (!innerParsed || !isNestedWritableFormat(innerParsed.format)) {
+    throw new Error(nestedReadOnlyError('The inner archive is read-only.'));
+  }
+
+  const outerStat = await fsp.stat(item.outerArchivePath).catch(() => null);
+  if (!outerStat || !outerStat.isFile()) {
+    throw new Error(nestedReadOnlyError('The outer archive is no longer available.'));
+  }
+  const outerParsed = await readArchive(
+    item.outerArchivePath,
+    outerStat,
+    await readMagic(item.outerArchivePath),
+  ).catch(() => null);
+  if (!outerParsed || !isNestedWritableFormat(outerParsed.format)) {
+    throw new Error(nestedReadOnlyError('The outer archive is read-only.'));
+  }
+}
+
+function isSolidSevenZip(filePath) {
+  return new Promise((resolve) => {
+    const child = spawn(resolveSevenZipBinary(), ['l', '-slt', filePath], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => {
+      output += chunk.toString('utf8');
+      if (output.length > 1024 * 1024) child.kill();
+    });
+    child.on('error', () => resolve(false));
+    child.on('close', () => resolve(/^Solid = \+/m.test(output)));
+  });
+}
+
+async function nestedEntrySize(outerArchivePath, stat, entryName) {
+  let entry = cachedMetaFor(outerArchivePath, stat)?.entries?.find(
+    (candidate) => candidate.name === entryName && !candidate.isDirectory,
+  );
+  if (!entry) {
+    const magic = await readMagic(outerArchivePath);
+    const parsed = await readArchive(outerArchivePath, stat, magic);
+    entry = parsed.entries.find(
+      (candidate) => candidate.name === entryName && !candidate.isDirectory,
+    );
+  }
+  if (!entry) throw new Error(`Entry not found in the outer archive: ${entryName}`);
+  return entry.size;
+}
+
+async function ensureNestedFreeSpace(entrySize) {
+  if (!Number.isFinite(entrySize) || entrySize <= 0) return;
+  let stats;
+  try {
+    stats = await fsp.statfs(os.tmpdir(), { bigint: true });
+  } catch (error) {
+    throw new Error(`Could not check free space on the temp drive: ${error.message || error}`);
+  }
+  const free = stats.bavail * stats.bsize;
+  const required = BigInt(entrySize) * 2n;
+  if (free < required) {
+    throw new Error(
+      `Not enough free space on the temp drive: ${Math.ceil(
+        Number(required) / 1024 / 1024,
+      )} MB required, ${Math.floor(Number(free) / 1024 / 1024)} MB available.`,
+    );
+  }
+}
+
+async function openNestedArchive({ outerArchivePath, entryName, confirmed = false }) {
+  if (!outerArchivePath) throw new Error('No outer archive is open.');
+  const extension = extensionOf(entryName);
+  if (!NESTED_ARCHIVE_EXTENSIONS.has(extension)) {
+    throw new Error(`Unsupported nested archive type: .${extension || 'unknown'}`);
+  }
+
+  const normalizedEntry = normalizeEntryName(entryName);
+  const stat = await fsp.stat(outerArchivePath).catch(() => null);
+  if (!stat || !stat.isFile()) throw new Error('Outer archive no longer exists.');
+
+  const entrySize = await nestedEntrySize(outerArchivePath, stat, normalizedEntry);
+  const resolvedOuter = path.resolve(outerArchivePath);
+  const cacheKey = `${resolvedOuter}|${normalizedEntry}|${stat.size}|${stat.mtimeMs}`;
+  const cached = nestedArchiveCache.get(cacheKey);
+  if (cached && fs.existsSync(cached.filePath)) {
+    return {
+      ok: true,
+      cached: true,
+      filePath: cached.filePath,
+      entryName: normalizedEntry,
+      sessionId: cached.sessionId,
+      outerArchivePath: resolvedOuter,
+      outerSize: stat.size,
+      outerMtimeMs: stat.mtimeMs,
+      entrySize,
+    };
+  }
+
+  if (entrySize > NESTED_CONFIRM_BYTES && confirmed !== true) {
+    return {
+      ok: false,
+      needsConfirmation: true,
+      entrySize,
+      error: `This entry is ${Math.round(entrySize / 1024 / 1024)} MB.`,
+    };
+  }
+
+  await ensureNestedFreeSpace(entrySize);
+
+  // A changed outer archive (or a previous extraction for the same entry)
+  // invalidates its old nested folder.
+  for (const [key, item] of nestedArchiveCache) {
+    if (path.resolve(item.outerArchivePath) !== resolvedOuter) continue;
+    if (item.entryName !== normalizedEntry) continue;
+    nestedArchiveCache.delete(key);
+    nestedRoots.delete(item.root);
+    await fsp.rm(item.root, { recursive: true, force: true }).catch(() => {});
+  }
+
+  const sessionId = randomUUID().replace(/[^A-Za-z0-9_-]/g, '');
+  const root = nestedRootFor(sessionId);
+  await fsp.mkdir(root, { recursive: true });
+  nestedRoots.add(root);
+
+  try {
+    sendProgress({
+      format: 'nested',
+      phase: 'extracting',
+      percent: null,
+      done: 0,
+      total: 1,
+      entry: normalizedEntry,
+      message: `Extracting ${path.basename(normalizedEntry)} from the outer archive…`,
+    });
+
+    const magic = await readMagic(outerArchivePath);
+    const meta = cachedMetaFor(outerArchivePath, stat);
+    if (isScsMagic(magic) || (meta && meta.format === 'scs')) {
+      await extractScsDragSelection(outerArchivePath, root, [normalizedEntry], stat);
+    } else {
+      await extractArchive({
+        filePath: outerArchivePath,
+        outputDir: root,
+        entries: [normalizedEntry],
+      });
+    }
+
+    const filePath = safeDragPath(root, normalizedEntry);
+    const extracted = await fsp.stat(filePath).catch(() => null);
+    if (!extracted || !extracted.isFile()) {
+      throw new Error('The nested archive could not be extracted.');
+    }
+
+    const result = {
+      filePath,
+      sessionId,
+      root,
+      entryName: normalizedEntry,
+      outerArchivePath: resolvedOuter,
+      outerSize: stat.size,
+      outerMtimeMs: stat.mtimeMs,
+      entrySize,
+    };
+    nestedArchiveCache.set(cacheKey, result);
+    sendProgress({
+      format: 'nested',
+      phase: 'done',
+      percent: 100,
+      done: 1,
+      total: 1,
+      entry: normalizedEntry,
+      message: 'Nested archive prepared',
+    });
+
+    return {
+      ok: true,
+      cached: false,
+      filePath,
+      entryName: normalizedEntry,
+      sessionId,
+      outerArchivePath: resolvedOuter,
+      outerSize: stat.size,
+      outerMtimeMs: stat.mtimeMs,
+      entrySize,
+    };
+  } catch (error) {
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+    nestedRoots.delete(root);
+    throw error;
+  }
+}
+
+async function writeBackNestedArchive({
+  outerArchivePath,
+  entryName,
+  nestedFilePath,
+  confirmed = false,
+}) {
+  if (!outerArchivePath || !nestedFilePath) throw new Error('No nested archive is open.');
+  const normalizedEntry = normalizeEntryName(entryName);
+  const parentPath = path.resolve(outerArchivePath);
+  const nestedPath = path.resolve(nestedFilePath);
+  const parentStat = await fsp.stat(parentPath).catch(() => null);
+  const nestedStat = await fsp.stat(nestedPath).catch(() => null);
+  if (!parentStat || !parentStat.isFile()) throw new Error('The outer archive no longer exists.');
+  if (!nestedStat || !nestedStat.isFile()) throw new Error('The nested archive no longer exists.');
+
+  const parentParsed = await readArchive(
+    parentPath,
+    parentStat,
+    await readMagic(parentPath),
+  );
+  if (!isNestedWritableFormat(parentParsed.format)) {
+    throw new Error(nestedReadOnlyError('The outer archive is read-only.'));
+  }
+  const nestedParsed = await readArchive(
+    nestedPath,
+    nestedStat,
+    await readMagic(nestedPath),
+  );
+  if (!isNestedWritableFormat(nestedParsed.format)) {
+    throw new Error(nestedReadOnlyError('The inner archive is read-only.'));
+  }
+
+  const parentEntry = parentParsed.entries.find(
+    (entry) => entry.name === normalizedEntry && !entry.isDirectory,
+  );
+  if (!parentEntry) throw new Error(`The outer archive has no entry named ${normalizedEntry}.`);
+
+  const innerSize = nestedStat.size;
+  const solid = parentParsed.format === '7z' && (await isSolidSevenZip(parentPath));
+  if (!confirmed && (innerSize > NESTED_CONFIRM_BYTES || solid)) {
+    return {
+      ok: false,
+      needsWarning: true,
+      innerSize,
+      solid,
+      outerFormat: parentParsed.format,
+    };
+  }
+
+  const id = randomUUID().replace(/[^A-Za-z0-9_-]/g, '');
+  const ext = path.extname(parentPath);
+  const tempOuter = path.join(
+    path.dirname(parentPath),
+    `.${path.basename(parentPath)}.openzip-writeback-${id}${ext}`,
+  );
+  const backupOuter = path.join(
+    path.dirname(parentPath),
+    `.${path.basename(parentPath)}.openzip-backup-${id}`,
+  );
+  const stageDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'openzip-writeback-'));
+  const stagedInner = path.join(stageDir, path.basename(normalizedEntry));
+
+  const sendWriteProgress = (phase, percent, message) => {
+    sendProgress({
+      format: 'nested-writeback',
+      phase,
+      percent,
+      done: null,
+      total: null,
+      entry: normalizedEntry,
+      message,
+    });
+  };
+
+  try {
+    sendWriteProgress('writing', 5, `Writing ${path.basename(normalizedEntry)} back to the outer archive…`);
+    await fsp.copyFile(nestedPath, stagedInner);
+    await fsp.copyFile(parentPath, tempOuter);
+
+    const slash = normalizedEntry.lastIndexOf('/');
+    const targetDir = slash >= 0 ? normalizedEntry.slice(0, slash) : '';
+    const addResult = await addFilesToArchive({
+      archivePath: tempOuter,
+      filePaths: [stagedInner],
+      targetDir,
+      allowNestedWrite: true,
+    });
+    if (!addResult || !addResult.success) {
+      throw new Error(addResult?.error ?? 'Could not update the temporary outer archive.');
+    }
+
+    sendWriteProgress('verifying', 70, 'Verifying the updated outer archive…');
+    const checkStat = await fsp.stat(tempOuter);
+    const checkParsed = await readArchive(tempOuter, checkStat, await readMagic(tempOuter));
+    const checkEntry = checkParsed.entries.find(
+      (entry) => entry.name === normalizedEntry && !entry.isDirectory,
+    );
+    if (!checkEntry || checkEntry.size !== innerSize) {
+      throw new Error(
+        `Verification failed: expected ${normalizedEntry} to be ${innerSize} bytes.`,
+      );
+    }
+
+    sendWriteProgress('replacing', 90, 'Replacing the original outer archive…');
+    let movedOriginal = false;
+    try {
+      await fsp.rename(parentPath, backupOuter);
+      movedOriginal = true;
+      await fsp.rename(tempOuter, parentPath);
+    } catch (error) {
+      if (movedOriginal) {
+        try {
+          await fsp.rename(backupOuter, parentPath);
+        } catch {
+          await fsp.copyFile(backupOuter, parentPath).catch(() => {});
+        }
+      }
+      throw new Error(
+        `Could not replace the outer archive. The original was left unchanged. ${
+          error.message || error
+        }`,
+      );
+    }
+
+    if (movedOriginal) await fsp.rm(backupOuter, { force: true }).catch(() => {});
+    invalidateNestedArchives(parentPath);
+    invalidateDragSessions(parentPath);
+    invalidateDragSessions(nestedPath);
+    archiveMetaCache.delete(parentPath);
+    sendWriteProgress('done', 100, 'Inner archive written back');
+    return {
+      ok: true,
+      entryName: normalizedEntry,
+      innerSize,
+      outerFormat: parentParsed.format,
+      solid,
+    };
+  } catch (error) {
+    sendWriteProgress('error', null, error.message || String(error));
+    throw error;
+  } finally {
+    await fsp.rm(stageDir, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(tempOuter, { force: true }).catch(() => {});
+    if (!fs.existsSync(parentPath)) {
+      // Last-resort restoration if a replacement failed after moving the original.
+      if (fs.existsSync(backupOuter)) {
+        await fsp.copyFile(backupOuter, parentPath).catch(() => {});
+        await fsp.rm(backupOuter, { force: true }).catch(() => {});
+      }
+    }
+  }
+}
+
+ipcMain.handle('archive:writeBackNested', async (_event, payload) => {
+  try {
+    return await writeBackNestedArchive(payload || {});
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:discardNested', async (_event, payload) => {
+  const outerArchivePath = (payload || {}).outerArchivePath;
+  if (outerArchivePath) invalidateNestedArchives(outerArchivePath);
+  const nestedFilePath = (payload || {}).nestedFilePath;
+  if (nestedFilePath) invalidateDragSessions(nestedFilePath);
+  return { success: true };
+});
+
+ipcMain.handle('archive:openNested', async (_event, payload) => {
+  try {
+    return await openNestedArchive(payload || {});
+  } catch (error) {
+    sendProgress({
+      format: 'nested',
+      phase: 'error',
+      percent: null,
+      done: 0,
+      total: null,
+      entry: '',
+      message: error.message || String(error),
+    });
+    return { ok: false, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:cleanupNested', async () => {
+  await cleanupAllNestedArchives();
+  return { success: true };
+});
+
+/* ------------------------------------------------------------------ */
 /* IPC handlers                                                        */
 /* ------------------------------------------------------------------ */
 
 ipcMain.handle('dialog:openArchive', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+  const lastOpenDir = getAppSettings().getExistingDir('lastOpenDir');
+  const options = {
     title: 'Open archive',
     properties: ['openFile'],
     filters: [
@@ -1442,7 +2657,9 @@ ipcMain.handle('dialog:openArchive', async () => {
       },
       { name: 'All files', extensions: ['*'] },
     ],
-  });
+  };
+  if (lastOpenDir) options.defaultPath = lastOpenDir;
+  const result = await dialog.showOpenDialog(mainWindow, options);
 
   if (result.canceled || result.filePaths.length === 0) {
     return { canceled: true, filePath: null };
@@ -1451,52 +2668,96 @@ ipcMain.handle('dialog:openArchive', async () => {
 });
 
 ipcMain.handle('dialog:selectOutputDir', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+  const lastExtractDir = getAppSettings().getExistingDir('lastExtractDir');
+  const options = {
     title: 'Select a folder to extract to',
     properties: ['openDirectory', 'createDirectory'],
     buttonLabel: 'Extract here',
-  });
+  };
+  if (lastExtractDir) options.defaultPath = lastExtractDir;
+  const result = await dialog.showOpenDialog(mainWindow, options);
 
   if (result.canceled || result.filePaths.length === 0) {
     return { canceled: true, filePath: null };
   }
-  return { canceled: false, filePath: result.filePaths[0] };
+  const selected = path.resolve(result.filePaths[0]);
+  getAppSettings().set('lastExtractDir', selected);
+  return { canceled: false, filePath: selected };
 });
+
+ipcMain.handle('dialog:dropChoice', async (_event, payload) => {
+  const rawName = payload && typeof payload.fileName === 'string' ? payload.fileName : '';
+  const fileName = rawName ? path.basename(rawName) : 'this archive';
+  const options = {
+    type: 'question',
+    buttons: ['Add to archive', 'Open it', 'Cancel'],
+    defaultId: 0,
+    cancelId: 2,
+    title: 'Dropped archive',
+    message: `What should OpenZip do with ${fileName}?`,
+    detail: 'Add it as a file inside the open archive, or open it instead.',
+  };
+  const result = mainWindow
+    ? await dialog.showMessageBox(mainWindow, options)
+    : await dialog.showMessageBox(options);
+  if (result.response === 0) return 'add';
+  if (result.response === 1) return 'open';
+  return 'cancel';
+});
+
+async function readArchiveForRenderer(filePath) {
+  if (!filePath) throw new Error('No file path was provided.');
+
+  const stat = await fsp.stat(filePath).catch(() => null);
+  if (!stat || !stat.isFile()) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  const magic = await readMagic(filePath);
+  const parsed = await readArchive(filePath, stat, magic);
+  rememberArchiveFolder(filePath);
+
+  // Only the currently open archive is needed for extraction bookkeeping.
+  archiveMetaCache.clear();
+  archiveMetaCache.set(filePath, {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    fileCount: parsed.stats.fileCount,
+    format: parsed.format,
+    entries: parsed.entries,
+  });
+
+  return {
+    ok: true,
+    filePath,
+    fileName: path.basename(filePath),
+    fileSize: stat.size,
+    format: parsed.format,
+    entries: parsed.entries,
+    stats: parsed.stats,
+    note:
+      parsed.note ??
+      (parsed.isScs
+        ? 'HashFS container detected. Extracting it will unpack the archive with the bundled SCS extractor.'
+        : null),
+  };
+}
 
 ipcMain.handle('archive:read', async (_event, filePath) => {
   try {
-    if (!filePath) throw new Error('No file path was provided.');
+    return await readArchiveForRenderer(filePath);
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+});
 
-    const stat = await fsp.stat(filePath).catch(() => null);
-    if (!stat || !stat.isFile()) {
-      throw new Error(`File not found: ${filePath}`);
+ipcMain.handle('archive:refresh', async (_event, filePath) => {
+  try {
+    if (filePath) {
+      archiveMetaCache.delete(filePath);
+      scsIndexCache.delete(filePath);
     }
-
-    const magic = await readMagic(filePath);
-    const parsed = await readArchive(filePath, stat, magic);
-
-    // Only the currently open archive is needed for extraction bookkeeping.
-    archiveMetaCache.clear();
-    archiveMetaCache.set(filePath, {
-      size: stat.size,
-      mtimeMs: stat.mtimeMs,
-      fileCount: parsed.stats.fileCount,
-      format: parsed.format,
-      entries: parsed.entries,
-    });
-
-    return {
-      ok: true,
-      filePath,
-      fileName: path.basename(filePath),
-      fileSize: stat.size,
-      format: parsed.format,
-      entries: parsed.entries,
-      stats: parsed.stats,
-      note: parsed.isScs
-        ? 'HashFS container detected. Extracting it will unpack the archive with the bundled SCS extractor.'
-        : null,
-    };
+    return await readArchiveForRenderer(filePath);
   } catch (error) {
     return { ok: false, error: error.message || String(error) };
   }
@@ -1533,8 +2794,65 @@ ipcMain.handle('archive:saveFile', async (_event, payload) => {
   try {
     const { archivePath, entryName, newContent } = payload || {};
     await saveArchiveEntry(archivePath, entryName, newContent);
+    invalidateDragSessions(archivePath);
+    invalidateNestedArchives(archivePath);
     return { success: true };
   } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:chooseScsModPath', async (_event, payload) => {
+  try {
+    return await chooseScsPath({ archivePath: (payload || {}).archivePath, mode: 'mod' });
+  } catch (error) {
+    return { canceled: false, filePath: null, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:chooseScsCopyPath', async (_event, payload) => {
+  try {
+    return await chooseScsPath({ archivePath: (payload || {}).archivePath, mode: 'copy' });
+  } catch (error) {
+    return { canceled: false, filePath: null, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:saveScsMod', async (_event, payload) => {
+  try {
+    const result = await saveScsMod(payload || {});
+    if (result.success) {
+      invalidateDragSessions((payload || {}).archivePath);
+      invalidateDragSessions((payload || {}).modPath);
+      invalidateNestedArchives((payload || {}).archivePath);
+      invalidateNestedArchives((payload || {}).modPath);
+    }
+    return result;
+  } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:saveScsCopy', async (_event, payload) => {
+  try {
+    const result = await saveScsModifiedCopy(payload || {});
+    if (result.success) {
+      invalidateDragSessions((payload || {}).archivePath);
+      invalidateDragSessions((payload || {}).outputPath);
+      invalidateNestedArchives((payload || {}).archivePath);
+      invalidateNestedArchives((payload || {}).outputPath);
+    }
+    return result;
+  } catch (error) {
+    sendProgress({
+      format: 'scs',
+      phase: 'error',
+      percent: null,
+      done: null,
+      total: null,
+      entry: '',
+      message: error.message || String(error),
+    });
     return { success: false, error: error.message || String(error) };
   }
 });
@@ -1551,7 +2869,12 @@ ipcMain.handle('archive:readImage', async (_event, payload) => {
 
 ipcMain.handle('archive:addFiles', async (_event, payload) => {
   try {
-    return await addFilesToArchive(payload || {});
+    const result = await addFilesToArchive(payload || {});
+    if (result.success) {
+      invalidateDragSessions((payload || {}).archivePath);
+      invalidateNestedArchives((payload || {}).archivePath);
+    }
+    return result;
   } catch (error) {
     return { success: false, error: error.message || String(error) };
   }
@@ -1562,6 +2885,11 @@ ipcMain.handle('archive:initialPath', () => {
   pendingInitialArchive = null;
   return initial;
 });
+
+ipcMain.handle('app:getVersion', () => ({
+  version: app.getVersion(),
+  packaged: app.isPackaged,
+}));
 
 ipcMain.handle('shell:openExternal', async (_event, url) => {
   if (typeof url === 'string' && (url.startsWith('https://') || url.startsWith('http://'))) {
@@ -1580,6 +2908,8 @@ ipcMain.handle('shell:openExternal', async (_event, url) => {
 /* ------------------------------------------------------------------ */
 
 app.whenReady().then(() => {
+  getAppSettings();
+  void sweepStaleTempFolders().catch(() => {});
   createWindow();
 
   app.on('activate', () => {
@@ -1589,4 +2919,9 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  cleanupAllDragRootsSync();
+  cleanupAllNestedArchivesSync();
 });

@@ -1,7 +1,7 @@
 {
   "name": "openzip",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Free WinRAR-style archive manager for Windows with SCS (ETS2/ATS) .scs support and a built-in code editor",
   "author": "alexgokawa",
   "license": "MIT",
@@ -19,6 +19,7 @@
     "dist:win": "npm run build && electron-builder --win",
     "lint": "eslint .",
     "preview": "vite preview",
+    "test:hashfs": "node scripts/hashfs-test.cjs",
     "electron:dev": "concurrently \"vite\" \"wait-on tcp:5173 && electron .\""
   },
   "dependencies": {
@@ -53,20 +54,22 @@
     "appId": "com.openzip.app",
     "productName": "OpenZip",
     "directories": {
-      "output": "dist"
+      "output": "release"
     },
     "files": [
       "dist/**/*",
-      "!dist/win-unpacked/**/*",
-      "!dist/*.exe",
-      "!dist/*.blockmap",
-      "!dist/*.yml",
-      "!dist/builder-*",
       "electron.cjs",
+      "scs-hashfs.cjs",
+      "temp-cleanup.cjs",
+      "app-settings.cjs",
+      "docs/icon.ico",
+      "docs/icon.png",
       "bin/**/*"
     ],
     "asarUnpack": [
-      "bin/**/*"
+      "bin/**/*",
+      "docs/icon.ico",
+      "docs/icon.png"
     ],
     "fileAssociations": [
       {
@@ -106,10 +109,10 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "artifactName": "OpenZip Setup.${ext}"
+      "artifactName": "OpenZip Setup ${version}.${ext}"
     },
     "portable": {
-      "artifactName": "OpenZip Portable.${ext}"
+      "artifactName": "OpenZip Portable ${version}.${ext}"
     }
   }
 }
