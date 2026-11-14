@@ -1206,6 +1206,20 @@ function describeSevenError(error) {
  * Resolves with the collected data rows (for list) or extraction summary, and
  * rejects with a readable error when 7-Zip reports one or exits non-zero.
  */
+/** The "ERROR = ..." line 7-Zip prints in a technical listing (stdout, not stderr). */
+function readSevenInfoError(info) {
+  const value = info && typeof info.get === 'function' ? info.get('ERROR') : '';
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function friendlySevenInfoError(text) {
+  const missing = /^Missing volume\s*:\s*(.+)$/i.exec(text);
+  if (missing) {
+    return `Missing archive part: ${missing[1].trim()}. Keep all parts of the archive in the same folder.`;
+  }
+  return text;
+}
+
 function rawSevenStderr(error) {
   return String(error && error.stderr ? error.stderr : '')
     .split(/\r?\n/)
@@ -1275,6 +1289,19 @@ function runSevenZip(method, archive, options, onEvent) {
       const child = stream._childProcess;
       const exitCode = child && typeof child.exitCode === 'number' ? child.exitCode : 0;
 
+      const infoError = friendlySevenInfoError(readSevenInfoError(stream.info));
+
+      if ((stream.err || exitCode !== 0) && infoError) {
+        // 7-Zip could still list part of the archive (for example when a volume is
+        // missing): open what was readable and carry the reason as a warning.
+        if (method === 'list' && rows.length > 0) {
+          logError('7zip:list:warning', infoError, `archive=${archive} exit=${exitCode}`);
+          resolve({ rows, info: stream.info, warning: infoError });
+          return;
+        }
+        rejectLogged(new Error(infoError), exitCode);
+        return;
+      }
       if (stream.err) {
         rejectLogged(stream.err, exitCode);
         return;
@@ -1315,7 +1342,7 @@ function toArchiveEntry(row) {
 
 /** Inspect any 7-Zip supported archive (zip, rar, 7z, iso, tar, cab, ...). */
 async function readWithSevenZip(filePath) {
-  const { rows, info } = await runSevenZip('list', filePath, { yes: true });
+  const { rows, info, warning } = await runSevenZip('list', filePath, { yes: true });
 
   const entries = rows
     .filter((row) => typeof row.file === 'string' && row.file.length > 0)
@@ -1333,6 +1360,7 @@ async function readWithSevenZip(filePath) {
   return {
     format,
     sevenType: formatFromSeven || null,
+    warning: warning || null,
     entries,
     stats: {
       fileCount: files.length,
@@ -2866,6 +2894,7 @@ async function readArchiveForRenderer(filePath) {
     format: parsed.format,
     entries: parsed.entries,
     stats: parsed.stats,
+    warning: parsed.warning ?? null,
     note:
       parsed.note ??
       (parsed.isScs

@@ -81,6 +81,7 @@ interface ReadResult {
   entries?: ArchiveEntry[]
   stats?: ArchiveStats
   note?: string | null
+  warning?: string | null
 }
 
 interface ExtractResult {
@@ -1307,14 +1308,21 @@ function App() {
         resetState()
         const isContainer =
           result.entries.length === 1 && result.entries[0].kind === 'container'
-        setStatus({
-          tone: 'info',
-          text: isContainer
-            ? 'HashFS container detected — ready to unpack with the bundled SCS extractor.'
-            : `${formatLabel(result.format ?? 'archive')} archive loaded — ${result.stats.fileCount} file${
-                result.stats.fileCount === 1 ? '' : 's'
-              }.`,
-        })
+        const loadedText = isContainer
+          ? 'HashFS container detected — ready to unpack with the bundled SCS extractor.'
+          : `${formatLabel(result.format ?? 'archive')} archive loaded — ${result.stats.fileCount} file${
+              result.stats.fileCount === 1 ? '' : 's'
+            }.`
+        setStatus(
+          result.warning
+            ? {
+                tone: 'error',
+                text: `Opened with errors: ${result.warning} Showing the ${result.stats.fileCount} file${
+                  result.stats.fileCount === 1 ? '' : 's'
+                } that could be read.`,
+              }
+            : { tone: 'info', text: loadedText },
+        )
       } catch (error) {
         setStatus({
           tone: 'error',
