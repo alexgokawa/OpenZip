@@ -341,6 +341,16 @@ function parseDirectoryListing(content) {
 }
 
 /**
+ * v1 directory listings: read the full stored block. Locked mods can carry a
+ * `size` smaller than the stored data, so an uncompressed listing is never
+ * cut to `size`.
+ */
+function readV1DirectoryData(fd, record) {
+  const raw = readAt(fd, record.offset, record.zsize);
+  return record.compression === 1 ? zlib.inflateSync(raw) : raw;
+}
+
+/**
  * Read-only support for legacy HashFS v1 archives (older mods such as
  * ETS2 Flarepack). v1 layout: 20-byte header (SCS#, u16 version, u16 salt,
  * "CITY", u32 entryCount, u32 entryTableOffset), followed by 32-byte entries:
@@ -366,7 +376,9 @@ function readHashFsV1Index(filePath, header) {
       const flags = table.readUInt32LE(base + 16);
       const size = table.readUInt32LE(base + 24);
       const zsize = table.readUInt32LE(base + 28);
-      const valid = offset + zsize <= header.size && size < 0x40000000;
+      // Locked mods scramble size/offset fields on purpose, so never drop an
+      // entry here; unreadable ones simply fail when they are actually read.
+      const valid = true;
       const entry = {
         hash: table.readBigUInt64LE(base).toString(),
         flags,
@@ -423,7 +435,7 @@ function readHashFsV1Index(filePath, header) {
         const entry = byHash.get(hashPath(name, header.salt).toString());
         if (entry && entry.record && entry.record.type === 'directory') queue.push({ pathName: name, entry });
       }
-      for (const name of ['manifest.sii', 'description.txt', 'mod_description.txt', 'mod_icon.jpg', 'mod_image.jpg', 'readme.txt', 'version.sii']) {
+      for (const name of ['manifest.sii', 'description.txt', 'mod_description.txt', 'mod_icon.jpg', 'mod_image.jpg', 'icon.jpg', 'readme.txt', 'version.sii']) {
         const entry = byHash.get(hashPath(name, header.salt).toString());
         if (entry && entry.record && entry.record.type === 'file') addFile(name, entry.record, entry.flags);
       }
@@ -436,17 +448,19 @@ function readHashFsV1Index(filePath, header) {
       if (seen.has(current.pathName)) continue;
       seen.add(current.pathName);
       const record = current.entry.record;
-      if (!record || record.type !== 'directory' || record.size > MAX_DIRECTORY_CONTENT) continue;
+      if (!record || (record.type !== 'directory' && !current.listedAsDirectory)) continue;
+      if (record.zsize > MAX_DIRECTORY_CONTENT) continue;
 
       let content;
       try {
-        content = readRecordData(fd, record);
+        content = readV1DirectoryData(fd, record);
       } catch {
         continue;
       }
       directories.push(current.pathName);
 
-      for (const rawName of content.toString('utf8').split(/\r?\n/)) {
+      for (const listed of content.toString('utf8').split(/\r?\n/)) {
+        const rawName = listed.trim();
         if (!rawName) continue;
         const isDirectory = rawName.startsWith('*');
         const name = isDirectory ? rawName.slice(1) : rawName;
@@ -456,7 +470,9 @@ function readHashFsV1Index(filePath, header) {
         const entry = byHash.get(hashPath(fullPath, header.salt).toString());
         if (!entry || !entry.record) continue;
         if (isDirectory || entry.record.type === 'directory') {
-          queue.push({ pathName: fullPath, entry });
+          // Locked mods clear the directory flag on folders; the "*" marker in
+          // the parent listing is the reliable signal, so trust it.
+          queue.push({ pathName: fullPath, entry, listedAsDirectory: isDirectory });
           continue;
         }
         addFile(fullPath, entry.record, entry.flags);

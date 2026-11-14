@@ -87,7 +87,13 @@ const READ_ONLY_EXTENSIONS = new Set(['rar', 'iso', 'udf', 'cab', 'gz', 'bz2', '
 const ARCHIVE_EXTENSIONS = ['rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'cab', 'zip'];
 
 /** Where the bundled SCS extractor may live. */
-const SCS_EXTRACTOR_NAMES = ['scs_extractor.exe', 'scs_extractor', 'extractor.exe', 'extractor'];
+const SCS_EXTRACTOR_NAMES = [
+  'power_extractor.exe',
+  'scs_extractor.exe',
+  'scs_extractor',
+  'extractor.exe',
+  'extractor',
+];
 
 /** Where the bundled full 7-Zip build may live. */
 const SEVEN_ZIP_NAMES = ['7z.exe', '7z'];
@@ -395,6 +401,9 @@ function resolveSevenZipBinary() {
 /** Cached CLI flavour per extractor path: 'legacy' or 'modern'. */
 const scsToolProfiles = new Map();
 
+/** Extractor paths whose `--help` lists `--flat` (power_extractor): extract without an archive-name subfolder. */
+const scsToolFlat = new Set();
+
 /**
  * The official `scs_extractor` accepts `[filePath] [outputDir]`, while newer
  * SCS extractors (including the one bundled in bin/) require `--dest=<dir>`.
@@ -413,6 +422,7 @@ function probeScsToolProfile(toolPath) {
       settled = true;
       if (timer) clearTimeout(timer);
       scsToolProfiles.set(toolPath, profile);
+      if (/--flat\b/.test(output)) scsToolFlat.add(toolPath);
       resolve(profile);
     };
 
@@ -1649,10 +1659,92 @@ function extractWithSevenZip({ filePath, outputDir, selectedEntries, format, met
   });
 }
 
+/**
+ * Extract a HashFS v1 mod with the built-in reader. Locked mods (hidden
+ * directory flags, no root listing) are unreadable by external extractors but
+ * are fully recovered by readHashFsIndex. `entries` limits the extraction to
+ * those files/folders; null or empty means everything.
+ */
+async function extractScsNative(filePath, stat, outputDir, entries) {
+  const index = readScsIndex(filePath, stat);
+  if (!index.supported || !index.header || index.header.version !== 1) return null;
+
+  const wanted = Array.isArray(entries)
+    ? entries
+        .map((entry) => String(entry).trim().replace(/[\\/]+$/, ''))
+        .filter(Boolean)
+        .map((entry) => normalizeEntryName(entry))
+    : [];
+  const files = index.files.filter((file) => {
+    if (file.packedImage) return false;
+    if (wanted.length === 0) return true;
+    return wanted.some((entry) => file.name === entry || file.name.startsWith(`${entry}/`));
+  });
+  if (files.length === 0) throw new Error('None of the selected files could be read.');
+
+  let done = 0;
+  let failed = 0;
+  let lastSent = 0;
+  let firstError = '';
+  for (const file of files) {
+    try {
+      const destination = safeDragPath(outputDir, file.name);
+      await fsp.mkdir(path.dirname(destination), { recursive: true });
+      await fsp.writeFile(destination, readHashFsEntry(index, file.name, Number.MAX_SAFE_INTEGER));
+      done += 1;
+    } catch (error) {
+      failed += 1;
+      if (!firstError) firstError = `${file.name}: ${error instanceof Error ? error.message : error}`;
+    }
+    const now = Date.now();
+    if (now - lastSent >= 60) {
+      lastSent = now;
+      sendProgress({
+        format: 'scs',
+        phase: 'extracting',
+        done: done + failed,
+        total: files.length,
+        percent: Math.round(((done + failed) / files.length) * 100),
+        entry: file.name,
+        message: `Extracting ${done + failed} of ${files.length}`,
+      });
+    }
+  }
+
+  if (done === 0) throw new Error(`Could not extract any file. ${firstError}`);
+
+  sendProgress({
+    format: 'scs',
+    phase: 'done',
+    done,
+    total: files.length,
+    percent: 100,
+    entry: '',
+    message: 'Extraction finished',
+  });
+  return {
+    ok: true,
+    format: 'scs',
+    outputDir,
+    extracted: done,
+    total: files.length,
+    message:
+      failed > 0
+        ? `Extracted ${done} file${done === 1 ? '' : 's'} to ${outputDir}. ${failed} could not be read (${firstError}).`
+        : `Extracted ${done} HashFS file${done === 1 ? '' : 's'} to ${outputDir}`,
+    log: [],
+  };
+}
+
 function extractScsWithTool(toolPath, filePath, outputDir, profile, extraArgs = []) {
   const args =
     profile === 'modern'
-      ? [filePath, `--dest=${outputDir}`, ...extraArgs]
+      ? [
+          filePath,
+          `--dest=${outputDir}`,
+          ...(scsToolFlat.has(toolPath) ? ['--flat'] : []),
+          ...extraArgs,
+        ]
       : [filePath, outputDir, ...extraArgs];
 
   return new Promise((resolve, reject) => {
@@ -1799,6 +1891,10 @@ async function extractArchive({ filePath, outputDir, entries }) {
     });
   }
 
+  // ---- HashFS v1 mods: built-in reader (handles locked archives) ----
+  const nativeResult = await extractScsNative(filePath, stat, outputDir, entries);
+  if (nativeResult) return nativeResult;
+
   // ---- Official HashFS SCS container ----
   const toolPath = resolveScsExtractor();
   if (!toolPath) {
@@ -1916,6 +2012,8 @@ function dragIcon() {
 }
 
 async function extractScsDragSelection(filePath, outputDir, entries, stat) {
+  if (await extractScsNative(filePath, stat, outputDir, entries)) return;
+
   const toolPath = resolveScsExtractor();
   if (!toolPath) {
     throw new Error(
