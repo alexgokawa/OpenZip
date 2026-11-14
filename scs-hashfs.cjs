@@ -341,11 +341,154 @@ function parseDirectoryListing(content) {
 }
 
 /**
+ * Read-only support for legacy HashFS v1 archives (older mods such as
+ * ETS2 Flarepack). v1 layout: 20-byte header (SCS#, u16 version, u16 salt,
+ * "CITY", u32 entryCount, u32 entryTableOffset), followed by 32-byte entries:
+ * u64 hash, u64 offset, u32 flags (1 = directory, 2 = zlib), u32 crc,
+ * u32 size, u32 zsize. Directory content is plain text, one name per line,
+ * sub-directories prefixed with "*".
+ */
+function readHashFsV1Index(filePath, header) {
+  const entryCount = header.header.readUInt32LE(12);
+  const tableOffset = header.header.readUInt32LE(16);
+  if (entryCount > 10_000_000 || tableOffset + entryCount * 32 > header.size) {
+    return { supported: false, reason: 'HashFS v1 entry table is invalid', header };
+  }
+
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const table = readAt(fd, tableOffset, entryCount * 32);
+    const byHash = new Map();
+    const entries = [];
+    for (let i = 0; i < entryCount; i += 1) {
+      const base = i * 32;
+      const offset = Number(table.readBigUInt64LE(base + 8));
+      const flags = table.readUInt32LE(base + 16);
+      const size = table.readUInt32LE(base + 24);
+      const zsize = table.readUInt32LE(base + 28);
+      const valid = offset + zsize <= header.size && size < 0x40000000;
+      const entry = {
+        hash: table.readBigUInt64LE(base).toString(),
+        flags,
+        order: i,
+        metaIndex: 0,
+        metaCount: 0,
+        record: valid
+          ? {
+              type: (flags & 1) ? 'directory' : 'file',
+              zsize,
+              size,
+              compression: (flags & 2) ? 1 : 0,
+              offset,
+              metaIndex: 0,
+              metaCount: 0,
+              recordOffset: 0,
+              flags,
+            }
+          : null,
+      };
+      byHash.set(entry.hash, entry);
+      entries.push(entry);
+    }
+
+    const rootEntry = byHash.get(hashPath('', header.salt).toString());
+    const files = [];
+    const directories = [];
+    const filesByPath = new Map();
+    const seen = new Set();
+    const queue = [];
+    const addFile = (fullPath, record, flags) => {
+      if (filesByPath.has(fullPath)) return;
+      const file = {
+        name: fullPath,
+        size: record.size,
+        packedSize: record.zsize,
+        offset: record.offset,
+        zsize: record.zsize,
+        compression: record.compression,
+        recordOffset: 0,
+        metaIndex: 0,
+        metaCount: 0,
+        flags,
+        packedImage: false,
+      };
+      files.push(file);
+      filesByPath.set(fullPath, file);
+    };
+    if (rootEntry && rootEntry.record && rootEntry.record.type === 'directory' && rootEntry.record.size > 0) {
+      queue.push({ pathName: '', entry: rootEntry });
+    } else {
+      // Many v1 mods ship without a root listing: probe the usual names.
+      for (const name of [...KNOWN_TOP_DIRS, 'base', 'base_share', 'base_vehicle', 'core', 'custom', 'asset', 'dlc_bus']) {
+        const entry = byHash.get(hashPath(name, header.salt).toString());
+        if (entry && entry.record && entry.record.type === 'directory') queue.push({ pathName: name, entry });
+      }
+      for (const name of ['manifest.sii', 'description.txt', 'mod_description.txt', 'mod_icon.jpg', 'mod_image.jpg', 'readme.txt', 'version.sii']) {
+        const entry = byHash.get(hashPath(name, header.salt).toString());
+        if (entry && entry.record && entry.record.type === 'file') addFile(name, entry.record, entry.flags);
+      }
+      if (queue.length === 0 && files.length === 0) {
+        return { supported: false, reason: 'top-level directory listing is missing', header, entries };
+      }
+    }
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (seen.has(current.pathName)) continue;
+      seen.add(current.pathName);
+      const record = current.entry.record;
+      if (!record || record.type !== 'directory' || record.size > MAX_DIRECTORY_CONTENT) continue;
+
+      let content;
+      try {
+        content = readRecordData(fd, record);
+      } catch {
+        continue;
+      }
+      directories.push(current.pathName);
+
+      for (const rawName of content.toString('utf8').split(/\r?\n/)) {
+        if (!rawName) continue;
+        const isDirectory = rawName.startsWith('*');
+        const name = isDirectory ? rawName.slice(1) : rawName;
+        if (!name) continue;
+        const fullPath = current.pathName ? `${current.pathName}/${name}` : name;
+        if (filesByPath.has(fullPath) || seen.has(fullPath)) continue;
+        const entry = byHash.get(hashPath(fullPath, header.salt).toString());
+        if (!entry || !entry.record) continue;
+        if (isDirectory || entry.record.type === 'directory') {
+          queue.push({ pathName: fullPath, entry });
+          continue;
+        }
+        addFile(fullPath, entry.record, entry.flags);
+      }
+    }
+
+    files.sort((a, b) => a.name.localeCompare(b.name));
+    return {
+      supported: true,
+      readOnly: true,
+      header,
+      table,
+      meta: Buffer.alloc(0),
+      tableCompressed: Buffer.alloc(0),
+      entries,
+      byHash,
+      files,
+      filesByPath,
+      directories,
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Parse a HashFS v2 archive and reconstruct its path tree.
  * Returns { supported: false, reason } for archives without a usable tree.
  */
 function readHashFsIndex(filePath) {
   const header = readHeader(filePath);
+  if (header.version === 1) return readHashFsV1Index(filePath, header);
   if (header.version !== 2) return { supported: false, reason: `HashFS v${header.version}`, header };
   if (header.entryCount > 10_000_000) {
     return { supported: false, reason: 'too many entries', header };
@@ -568,6 +711,7 @@ async function writeHashFsCopy(filePath, outputPath, editedFiles, options = {}) 
 
   const index = readHashFsIndex(filePath);
   if (!index.supported) throw new Error(index.reason || 'HashFS archive is not readable.');
+  if (index.readOnly) throw new Error('HashFS v1 archives are read-only in OpenZip. Extract them instead of saving edits.');
 
   const records = [];
   for (const [entryName, rawContent] of edits) {

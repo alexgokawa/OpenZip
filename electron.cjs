@@ -18,8 +18,11 @@ const {
   readHashFsEntry,
   writeHashFsCopy,
 } = require('./scs-hashfs.cjs');
+const { decodeDds, rgbaToBgra } = require('./dds-reader.cjs');
+const { decodeTga } = require('./tga-reader.cjs');
 const { sweepStaleTempFolders } = require('./temp-cleanup.cjs');
 const { createSettingsStore } = require('./app-settings.cjs');
+const { createErrorLog } = require('./error-log.cjs');
 const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -42,6 +45,9 @@ const MAX_EDITABLE_BYTES = 20 * 1024 * 1024;
 
 /** Upper bound for images loaded into the in-app viewer. */
 const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+
+/** DDS/TGA textures are often large uncompressed files (e.g. 64 MB 4096x4096 RGBA). */
+const MAX_DDS_BYTES = 256 * 1024 * 1024;
 
 /** Error returned for archive formats that cannot be modified. */
 const READ_ONLY_INJECT_ERROR = 'This archive format is read-only. Cannot inject files.';
@@ -116,6 +122,78 @@ function getAppSettings() {
   }
   return appSettings;
 }
+
+/* ------------------------------------------------------------------ */
+/* Error log                                                           */
+/* ------------------------------------------------------------------ */
+
+let errorLog = null;
+function getErrorLog() {
+  if (!errorLog) {
+    errorLog = createErrorLog({
+      logDir: path.join(app.getPath('userData'), 'logs'),
+      version: app.getVersion(),
+    });
+  }
+  return errorLog;
+}
+
+function logError(context, error, details) {
+  return getErrorLog().log(context, error, details);
+}
+
+/** Short, content-free description of an IPC payload (paths only). */
+function summarizeIpcArgs(args) {
+  const first = args[0];
+  if (typeof first === 'string') return first;
+  if (first && typeof first === 'object') {
+    const parts = [];
+    for (const key of ['archivePath', 'entryName', 'filePath', 'outputDir']) {
+      if (typeof first[key] === 'string') parts.push(`${key}=${first[key]}`);
+    }
+    return parts.join(' ');
+  }
+  return '';
+}
+
+// Every IPC handler logs thrown errors and { success: false, error } results.
+const rawIpcHandle = ipcMain.handle.bind(ipcMain);
+ipcMain.handle = (channel, listener) =>
+  rawIpcHandle(channel, async (event, ...args) => {
+    try {
+      const result = await listener(event, ...args);
+      const failed =
+        result &&
+        typeof result === 'object' &&
+        (result.success === false || result.ok === false) &&
+        result.error &&
+        !result.needsConfirmation &&
+        !result.needsWarning;
+      if (failed) {
+        logError(`ipc:${channel}`, result.error, summarizeIpcArgs(args));
+      }
+      return result;
+    } catch (error) {
+      logError(`ipc:${channel}`, error, summarizeIpcArgs(args));
+      throw error;
+    }
+  });
+
+process.on('uncaughtException', (error) => {
+  logError('main:uncaughtException', error);
+  try {
+    dialog.showErrorBox(
+      'OpenZip error',
+      `${error && error.message ? error.message : String(error)}\n\nDetails were saved to:\n${getErrorLog().filePath}`,
+    );
+  } catch {
+    // ignore
+  }
+});
+
+process.on('unhandledRejection', (reason) => {
+  logError('main:unhandledRejection', reason);
+});
 
 function rememberArchiveFolder(filePath) {
   if (!filePath || isNestedArchivePath(filePath)) return;
@@ -204,6 +282,13 @@ function createWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('theme:changed', themePayload());
     }
+  });
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    logError('renderer:process-gone', `reason=${details.reason} exitCode=${details.exitCode}`);
+  });
+  mainWindow.webContents.on('did-fail-load', (_event, code, description, url) => {
+    logError('renderer:did-fail-load', `${description} (${code})`, url);
   });
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
@@ -573,6 +658,19 @@ async function readArchiveEntry(archivePath, entryName) {
 
 async function readImageEntry(archivePath, entryName) {
   const name = normalizeEntryName(entryName);
+  const textureExt = extensionOf(name);
+  if (textureExt === 'dds' || textureExt === 'tga') {
+    const buffer = await readArchiveEntryBuffer(archivePath, name, MAX_DDS_BYTES);
+    const result = textureExt === 'dds' ? decodeDds(buffer) : decodeTga(buffer);
+    const png = nativeImage
+      .createFromBitmap(rgbaToBgra(result.rgba), {
+        width: result.width,
+        height: result.height,
+      })
+      .toPNG();
+    return `data:image/png;base64,${png.toString('base64')}`;
+  }
+
   const mime = IMAGE_MIME_TYPES[extensionOf(name)];
   if (!mime) throw new Error('This file type is not supported by the image viewer.');
 
@@ -641,6 +739,11 @@ async function writeZipAtomically(zip, filePath) {
     await fsp.rename(tempPath, filePath);
   } catch (error) {
     await fsp.rm(tempPath, { force: true }).catch(() => {});
+    if (error.code === 'EPERM' || error.code === 'EBUSY' || error.code === 'EACCES') {
+      throw new Error(
+        'Could not write the archive: the file is locked by another program (for example a mod manager or the game). Close it and try again.',
+      );
+    }
     throw new Error(`Could not write the archive: ${error.message}`);
   }
 }
@@ -1077,8 +1180,14 @@ function describeSevenError(error) {
       .filter(Boolean)
       .filter((line) => !/^7-Zip\s/i.test(line));
 
+    // Prefer the line that states the reason; "ERROR: <path>" lines only name the file.
     const meaningful =
-      lines.find((line) => /error|can not|cannot|wrong password|unsupported|not supported/i.test(line)) ||
+      lines.find((line) =>
+        /can not|cannot|wrong password|unsupported|not supported|is not|unexpected end|data error|crc failed|headers error/i.test(
+          line,
+        ),
+      ) ||
+      lines.find((line) => /error/i.test(line)) ||
       lines[lines.length - 1];
 
     if (meaningful) {
@@ -1097,8 +1206,27 @@ function describeSevenError(error) {
  * Resolves with the collected data rows (for list) or extraction summary, and
  * rejects with a readable error when 7-Zip reports one or exits non-zero.
  */
+function rawSevenStderr(error) {
+  return String(error && error.stderr ? error.stderr : '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' | ');
+}
+
 function runSevenZip(method, archive, options, onEvent) {
   return new Promise((resolve, reject) => {
+    // Rejects with a readable message and records 7-Zip's raw output in the error log.
+    const rejectLogged = (error, exitCode) => {
+      const message = describeSevenError(error);
+      const parts = [`archive=${archive}`];
+      if (exitCode !== undefined) parts.push(`exit=${exitCode}`);
+      const stderr = rawSevenStderr(error);
+      parts.push(`stderr=${stderr || '(none)'}`);
+      logError(`7zip:${method}`, message, parts.join(' '));
+      reject(new Error(message));
+    };
+
     let stream;
     try {
       stream = Seven[method](archive, {
@@ -1107,7 +1235,7 @@ function runSevenZip(method, archive, options, onEvent) {
         ...options,
       });
     } catch (error) {
-      reject(new Error(describeSevenError(error)));
+      rejectLogged(error);
       return;
     }
 
@@ -1125,7 +1253,7 @@ function runSevenZip(method, archive, options, onEvent) {
     const fail = (error) => {
       if (settled) return;
       settled = true;
-      reject(new Error(describeSevenError(error)));
+      rejectLogged(error);
     };
 
     stream.on('data', (data) => {
@@ -1148,11 +1276,14 @@ function runSevenZip(method, archive, options, onEvent) {
       const exitCode = child && typeof child.exitCode === 'number' ? child.exitCode : 0;
 
       if (stream.err) {
-        reject(new Error(describeSevenError(stream.err)));
+        rejectLogged(stream.err, exitCode);
         return;
       }
       if (exitCode !== 0) {
-        reject(new Error(`7-Zip exited with code ${exitCode} while reading ${path.basename(archive)}`));
+        rejectLogged(
+          new Error(`7-Zip exited with code ${exitCode} while reading ${path.basename(archive)}`),
+          exitCode,
+        );
         return;
       }
 
@@ -2884,6 +3015,36 @@ ipcMain.handle('archive:initialPath', () => {
   const initial = pendingInitialArchive;
   pendingInitialArchive = null;
   return initial;
+});
+
+let rendererErrorCount = 0;
+ipcMain.handle('log:renderer', (_event, payload) => {
+  if (rendererErrorCount >= 50) return { success: false };
+  rendererErrorCount += 1;
+  const { message, stack, source } = payload || {};
+  const text = typeof message === 'string' && message ? message : 'Unknown renderer error';
+  const error = new Error(text);
+  if (typeof stack === 'string' && stack) {
+    error.stack = `Error: ${text}\n${stack.split('\n').slice(1).join('\n')}`;
+  }
+  logError(`renderer:${typeof source === 'string' ? source : 'error'}`, error);
+  return { success: true };
+});
+
+ipcMain.handle('log:open', async () => {
+  const log = getErrorLog();
+  try {
+    if (!fs.existsSync(log.filePath)) {
+      return { success: true, empty: true, path: log.filePath };
+    }
+    const failure = await shell.openPath(log.filePath);
+    if (failure) {
+      shell.showItemInFolder(log.filePath);
+    }
+    return { success: true, empty: false, path: log.filePath };
+  } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
 });
 
 ipcMain.handle('app:getVersion', () => ({

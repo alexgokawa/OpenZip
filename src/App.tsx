@@ -580,7 +580,7 @@ function fileExtension(path: string): string {
   return dot < 0 ? '' : name.slice(dot + 1).toLowerCase()
 }
 
-const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'bmp', 'webp', 'ico', 'gif'])
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'bmp', 'webp', 'ico', 'gif', 'dds', 'tga'])
 
 const BINARY_EXTENSIONS = new Set([
   'pmd',
@@ -726,6 +726,26 @@ function App() {
       .catch(() => {
         /* version label is optional */
       })
+  }, [])
+
+  /* ----- renderer errors -> error log ----- */
+
+  useEffect(() => {
+    const ipc = ipcRef.current
+    if (!ipc) return
+    const report = (source: string, reason: unknown) => {
+      const err = reason instanceof Error ? reason : null
+      const message = err ? err.message : String(reason ?? 'Unknown error')
+      void ipc.invoke('log:renderer', { source, message, stack: err?.stack ?? '' }).catch(() => {})
+    }
+    const onError = (event: ErrorEvent) => report('error', event.error ?? event.message)
+    const onRejection = (event: PromiseRejectionEvent) => report('unhandledrejection', event.reason)
+    window.addEventListener('error', onError)
+    window.addEventListener('unhandledrejection', onRejection)
+    return () => {
+      window.removeEventListener('error', onError)
+      window.removeEventListener('unhandledrejection', onRejection)
+    }
   }, [])
 
   /* ----- system theme (Windows light/dark, live) ----- */
@@ -1427,6 +1447,28 @@ function App() {
     if (editingFile.isDirty && !window.confirm('Discard unsaved changes?')) return
     closeOverlayToFolder(currentPath, 'Editor closed')
   }, [closeOverlayToFolder, currentPath, editingFile])
+
+  const handleOpenErrorLog = useCallback(async () => {
+    const ipc = ipcRef.current
+    if (!ipc) return
+    try {
+      const result = (await ipc.invoke('log:open')) as {
+        success: boolean
+        empty?: boolean
+        error?: string
+      }
+      if (!result?.success) {
+        setStatus({ tone: 'error', text: result?.error ?? 'Could not open the error log.' })
+      } else if (result.empty) {
+        setStatus({ tone: 'info', text: 'No errors have been logged yet.' })
+      }
+    } catch (error) {
+      setStatus({
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Could not open the error log.',
+      })
+    }
+  }, [])
 
   const handleOpenImage = useCallback(
     async (entryName: string, recordHistory = true) => {
@@ -3142,6 +3184,17 @@ function App() {
         >
           GitHub
         </a>
+        <span className="footer-sep" aria-hidden="true">
+          ·
+        </span>
+        <button
+          type="button"
+          className="footer-link footer-button github"
+          onClick={() => void handleOpenErrorLog()}
+          title="Open the error log"
+        >
+          Error log
+        </button>
       </footer>
 
       {dragActive && (

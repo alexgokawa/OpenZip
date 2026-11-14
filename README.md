@@ -29,7 +29,10 @@ first run. Choose **More info**, then **Run anyway**. You can also build the app
 - Bottom status bar with archive/file counts, live extraction progress, and clear error reporting.
 - **Built-in Monaco editor** for text/config files, with `Ctrl+S` writing changes straight back into the archive.
 - **Drag-and-drop injection** of files, folders and images into writable archives (or drop an archive to open it).
-- **In-app image viewer** for PNG, JPEG, BMP, WEBP, ICO and GIF entries, with dimensions and Esc-to-close.
+- **In-app image viewer** for PNG, JPEG, BMP, WEBP, ICO, GIF, **DDS** and **TGA** entries, with dimensions,
+  a checkerboard behind transparent pixels, and Esc-to-close.
+- **Error log** (`openzip-errors.log` under Electron's userData `logs` folder) that records failed archive
+  operations, crashes and interface errors; open it from the **Error log** link in the footer.
 - **External links footer** with Ko-fi and GitHub links that open in the system browser via a validated
   `shell:openExternal` IPC handler.
 - **Windows Explorer navigation** with Back/Forward history, Up, Refresh, breadcrumbs and shortcuts;
@@ -190,8 +193,9 @@ archive reader, so nested HashFS `.scs` files get their directory tree too.
 
 ## Image viewer
 
-Double-click an image entry (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`, `.ico`, `.gif`) to open a centered
-preview modal. The header shows the file name and actual pixel dimensions; the **Close** button or
+Double-click an image entry (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`, `.ico`, `.gif`, `.dds`, `.tga`) to open a
+centered preview modal. DDS (DXT1/3/5, BC4/BC5 and uncompressed; not BC6H/BC7) and TGA files are decoded in
+the main process and shown as PNG; transparent pixels appear over a checkerboard. The header shows the file name and actual pixel dimensions; the **Close** button or
 `Esc` dismisses it. Image data is read in memory and returned as a data URL by the main process.
 
 ![OpenZip image viewer over an archive](docs/image-viewer.png)
@@ -287,7 +291,8 @@ The main process ([`electron.cjs`](electron.cjs)) exposes these IPC handlers:
   targets. HashFS archives keep routing to the bundled SCS extractor.
 - `archive:readFile` — loads one text entry in memory for the built-in editor.
 - `archive:saveFile` — writes an edited entry back into ZIP/7z/TAR archives.
-- `archive:readImage` — returns an image entry as a base64 data URL.
+- `archive:readImage` — returns an image entry as a base64 data URL (DDS/TGA are decoded to PNG first).
+- `log:open` / `log:renderer` — open the error log, and let the interface report its own errors to it.
 - `archive:addFiles` — injects dropped files/folders into ZIP/7z/TAR archives.
 - `archive:initialPath` — once-only handoff of an archive path passed on the command line.
 
