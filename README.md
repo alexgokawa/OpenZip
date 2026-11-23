@@ -29,6 +29,8 @@ first run. Choose **More info**, then **Run anyway**. You can also build the app
 - Bottom status bar with archive/file counts, live extraction progress, and clear error reporting.
 - **Built-in Monaco editor** for text/config files, with `Ctrl+S` writing changes straight back into the archive.
 - **Drag-and-drop injection** of files, folders and images into writable archives (or drop an archive to open it).
+- **Delete** (`Delete` key) and **Copy / Paste** (`Ctrl+C` / `Ctrl+V`) for files and folders inside writable `zip`, `7z`
+  and `tar` archives. Copy from any archive, including read-only ones such as `.scs` or `rar`, and paste into a writable one.
 - **In-app image viewer** for PNG, JPEG, BMP, WEBP, ICO, GIF, **DDS** and **TGA** entries, with dimensions,
   a checkerboard behind transparent pixels, and Esc-to-close.
 - **Error log** (`openzip-errors.log` under Electron's userData `logs` folder) that records failed archive

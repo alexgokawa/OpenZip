@@ -6,6 +6,8 @@ import {
   ArrowUp,
   CheckCircle2,
   ChevronRight,
+  ClipboardPaste,
+  Copy,
   Download,
   File as FileIcon,
   FileArchive,
@@ -21,6 +23,7 @@ import {
   RotateCcw,
   RotateCw,
   Save,
+  Trash2,
   Upload,
   X,
 } from 'lucide-react'
@@ -680,6 +683,11 @@ function App() {
   const archiveStackRef = useRef<ArchiveFrame[]>([])
   const [currentPath, setCurrentPath] = useState('')
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [clipboard, setClipboard] = useState<{
+    archivePath: string
+    roots: string[]
+    entries: string[]
+  } | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('name')
   const [sortDir, setSortDir] = useState<SortDir>(1)
   const [busy, setBusy] = useState<BusyState>(null)
@@ -860,6 +868,12 @@ function App() {
   const nestedReadOnlyMessage = nestedReadOnlyReason
     ? `${NESTED_READ_ONLY_MESSAGE} ${nestedReadOnlyReason}`
     : NESTED_READ_ONLY_MESSAGE
+  const canModifyArchive = Boolean(
+    archive &&
+      !isScsContainer &&
+      isWritableArchiveFormat(archive.format) &&
+      (!isNestedArchive || nestedCanEdit),
+  )
   const archiveChainLabel = archive
     ? [...archiveStack.map((frame) => frame.archive.fileName), archive.fileName].join(' > ')
     : ''
@@ -1650,6 +1664,160 @@ function App() {
       scsHasUnappliedEdits,
     ],
   )
+
+  const handleCopySelection = useCallback(() => {
+    if (!archive || selected.size === 0) return false
+    const roots = [...selected]
+    const entries = collectSelection(archive.entries, selected) ?? []
+    setClipboard({ archivePath: archive.filePath, roots, entries })
+    setStatus({
+      tone: 'info',
+      text: `Copied ${roots.length} item${roots.length === 1 ? '' : 's'}. Open the target folder and press Ctrl+V.`,
+    })
+    return true
+  }, [archive, selected])
+
+  const handlePaste = useCallback(async () => {
+    const ipc = ipcRef.current
+    if (!ipc || !archive || !clipboard || busy) return
+
+    if (!canModifyArchive) {
+      setStatus({
+        tone: 'error',
+        text:
+          isNestedArchive && !nestedCanEdit
+            ? nestedReadOnlyMessage
+            : 'This archive format is read-only. Cannot paste files.',
+      })
+      return
+    }
+
+    const targetDir = currentPath.replace(/\/$/, '')
+    const sameArchive = clipboard.archivePath === archive.filePath
+    const existing = new Set(archive.entries.map((entry) => entry.name.replace(/\/$/, '')))
+    const collisions = clipboard.roots
+      .map((root) => root.replace(/\/$/, ''))
+      .filter((root) => {
+        const base = root.split('/').pop() ?? root
+        const parent = root.includes('/') ? root.slice(0, root.lastIndexOf('/')) : ''
+        if (sameArchive && parent === targetDir) return false // pasted as "name - Copy"
+        return existing.has(targetDir ? `${targetDir}/${base}` : base)
+      })
+    if (
+      collisions.length > 0 &&
+      !window.confirm(
+        `${collisions.length} item${collisions.length === 1 ? '' : 's'} already exist in this folder and will be replaced. Continue?`,
+      )
+    ) {
+      return
+    }
+
+    setBusy('adding')
+    setStatus({ tone: 'info', text: `Pasting ${clipboard.roots.length} item(s)…` })
+    try {
+      const result = (await ipc.invoke('archive:copyEntries', {
+        sourceArchivePath: clipboard.archivePath,
+        archivePath: archive.filePath,
+        roots: clipboard.roots,
+        entries: clipboard.entries,
+        targetDir,
+      })) as AddFilesResult
+
+      if (!result || !result.success) {
+        setStatus({ tone: 'error', text: result?.error ?? 'Could not paste into the archive.' })
+        return
+      }
+
+      await refreshArchiveEntries(archive.filePath)
+      setSelected(new Set())
+      invalidateDragPreparation()
+      if (isNestedArchive) setNestedModified(true)
+      const added = result.added ?? clipboard.roots.length
+      setStatus({ tone: 'success', text: `Pasted ${added} item${added === 1 ? '' : 's'}` })
+    } catch (error) {
+      setStatus({
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Could not paste into the archive.',
+      })
+    } finally {
+      setBusy(null)
+    }
+  }, [
+    archive,
+    busy,
+    canModifyArchive,
+    clipboard,
+    currentPath,
+    invalidateDragPreparation,
+    isNestedArchive,
+    nestedCanEdit,
+    nestedReadOnlyMessage,
+    refreshArchiveEntries,
+  ])
+
+  const handleDeleteSelection = useCallback(async () => {
+    const ipc = ipcRef.current
+    if (!ipc || !archive || busy || selected.size === 0) return
+
+    if (!canModifyArchive) {
+      setStatus({
+        tone: 'error',
+        text:
+          isNestedArchive && !nestedCanEdit
+            ? nestedReadOnlyMessage
+            : 'This archive format is read-only. Cannot delete files.',
+      })
+      return
+    }
+
+    const roots = [...selected]
+    const entries = collectSelection(archive.entries, selected) ?? []
+    const label =
+      roots.length === 1 ? `"${baseName(roots[0].replace(/\/$/, ''))}"` : `${roots.length} items`
+    if (!window.confirm(`Delete ${label} from the archive? This cannot be undone.`)) return
+
+    setBusy('adding')
+    setStatus({ tone: 'info', text: `Deleting ${roots.length} item(s)… large archives take a while to rewrite.` })
+    try {
+      const result = (await ipc.invoke('archive:deleteEntries', {
+        archivePath: archive.filePath,
+        roots,
+        entries,
+      })) as { success: boolean; deleted?: number; error?: string }
+
+      if (!result || !result.success) {
+        setStatus({ tone: 'error', text: result?.error ?? 'Could not delete from the archive.' })
+        return
+      }
+
+      await refreshArchiveEntries(archive.filePath)
+      setSelected(new Set())
+      setClipboard((current) => (current && current.archivePath === archive.filePath ? null : current))
+      invalidateDragPreparation()
+      if (isNestedArchive) setNestedModified(true)
+      setStatus({
+        tone: 'success',
+        text: `Deleted ${roots.length} item${roots.length === 1 ? '' : 's'}`,
+      })
+    } catch (error) {
+      setStatus({
+        tone: 'error',
+        text: error instanceof Error ? error.message : 'Could not delete from the archive.',
+      })
+    } finally {
+      setBusy(null)
+    }
+  }, [
+    archive,
+    busy,
+    canModifyArchive,
+    invalidateDragPreparation,
+    isNestedArchive,
+    nestedCanEdit,
+    nestedReadOnlyMessage,
+    refreshArchiveEntries,
+    selected,
+  ])
 
   const handleDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
     if (dragOutRef.current) return
@@ -2516,6 +2684,49 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [editingFile, handleSaveFile])
 
+  // Ctrl+C / Ctrl+V / Delete on the selected rows.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!archive || editingFile || imagePreview || busy) return
+      const target = event.target as HTMLElement | null
+      const isTextTarget = Boolean(
+        target &&
+          (target.tagName === 'INPUT' ||
+            target.tagName === 'TEXTAREA' ||
+            target.isContentEditable ||
+            target.closest('.monaco-editor')),
+      )
+      if (isTextTarget) return
+
+      const withCtrl = event.ctrlKey || event.metaKey
+      const key = event.key.toLowerCase()
+      if (withCtrl && key === 'c') {
+        if (handleCopySelection()) event.preventDefault()
+      } else if (withCtrl && key === 'v') {
+        if (clipboard) {
+          event.preventDefault()
+          void handlePaste()
+        }
+      } else if (!withCtrl && !event.altKey && event.key === 'Delete' && selected.size > 0) {
+        event.preventDefault()
+        void handleDeleteSelection()
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [
+    archive,
+    busy,
+    clipboard,
+    editingFile,
+    handleCopySelection,
+    handleDeleteSelection,
+    handlePaste,
+    imagePreview,
+    selected,
+  ])
+
   // Windows Explorer navigation shortcuts.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2670,6 +2881,36 @@ function App() {
         >
           {extracting ? <Loader2 size={16} className="spin" /> : <Download size={16} />}
           <span>Extract To</span>
+        </button>
+        <button
+          type="button"
+          className="tool-btn"
+          onClick={() => handleCopySelection()}
+          disabled={!archive || busy !== null || selected.size === 0}
+          title="Copy selected items (Ctrl+C)"
+        >
+          <Copy size={16} />
+          <span>Copy</span>
+        </button>
+        <button
+          type="button"
+          className="tool-btn"
+          onClick={() => void handlePaste()}
+          disabled={!canModifyArchive || busy !== null || !clipboard}
+          title="Paste into the current folder (Ctrl+V)"
+        >
+          <ClipboardPaste size={16} />
+          <span>Paste</span>
+        </button>
+        <button
+          type="button"
+          className="tool-btn"
+          onClick={() => void handleDeleteSelection()}
+          disabled={!canModifyArchive || busy !== null || selected.size === 0}
+          title="Delete selected items (Delete)"
+        >
+          <Trash2 size={16} />
+          <span>Delete</span>
         </button>
         <button
           type="button"

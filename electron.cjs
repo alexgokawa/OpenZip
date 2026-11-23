@@ -1179,6 +1179,182 @@ async function addFilesToArchive({
   return { success: true, added: sources.length };
 }
 
+/** Strip trailing slashes and validate an archive entry name or folder name. */
+function cleanEntryNames(values) {
+  if (!Array.isArray(values)) return [];
+  const names = new Set();
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim().replace(/[\\/]+$/, '');
+    if (!trimmed) continue;
+    names.add(normalizeEntryName(trimmed));
+  }
+  return [...names];
+}
+
+/** `7z d` for 7z/tar archives. Names come from a UTF-8 list file, so no length limit. */
+async function runSevenZipDelete(archivePath, names) {
+  const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'openzip-del-'));
+  try {
+    const listPath = path.join(workDir, 'names.txt');
+    await fsp.writeFile(listPath, names.join('\n'), 'utf8');
+
+    await new Promise((resolve, reject) => {
+      const child = spawn(
+        resolveSevenZipBinary(),
+        ['d', archivePath, `@${listPath}`, '-y', '-spd', '-scsUTF-8'],
+        { cwd: workDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let output = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        output += chunk.toString();
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on('error', (error) => {
+        reject(
+          new Error(
+            error.code === 'ENOENT'
+              ? 'The bundled 7-Zip engine could not be started.'
+              : `Could not delete from the archive: ${error.message}`,
+          ),
+        );
+      });
+      child.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+          return;
+        }
+        const error = new Error('7-Zip could not delete the selected items.');
+        error.stderr = stderr || output;
+        reject(new Error(describeSevenError(error)));
+      });
+    });
+  } finally {
+    await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** Delete files and folders from a ZIP, 7z or TAR archive. */
+async function deleteEntriesFromArchive({ archivePath, roots, entries }) {
+  if (!archivePath) throw new Error('No archive is open.');
+  await ensureNestedWritable(archivePath);
+
+  const rootNames = cleanEntryNames(roots);
+  const fileNames = cleanEntryNames(entries);
+  if (rootNames.length === 0 && fileNames.length === 0) {
+    throw new Error('Select at least one file or folder to delete.');
+  }
+
+  const kind = await archiveInjectionKind(archivePath);
+  const allNames = [...new Set([...rootNames, ...fileNames])];
+  let deleted = fileNames.length || rootNames.length;
+
+  try {
+    // 7-Zip streams the archive in a separate process: the app stays responsive
+    // and unchanged compressed data is copied, not recompressed.
+    await runSevenZipDelete(archivePath, allNames);
+  } catch (error) {
+    if (kind !== 'zip') throw error;
+
+    // ZIP fallback: in-memory rewrite (slower, but independent of 7-Zip).
+    let zip;
+    try {
+      zip = new AdmZip(archivePath);
+    } catch (zipError) {
+      throw new Error(`Could not open ZIP archive: ${zipError.message}`);
+    }
+    if (zip.getEntries().some((entry) => entry.header && entry.header.encrypted)) {
+      throw new Error('Encrypted archives cannot be modified.');
+    }
+
+    const wanted = new Set(fileNames);
+    const folders = new Set(rootNames);
+    const matches = zip.getEntries().filter((entry) => {
+      const name = entry.entryName.replace(/\/+$/, '');
+      if (wanted.has(name) || folders.has(name)) return true;
+      for (const folder of folders) {
+        if (name.startsWith(`${folder}/`)) return true;
+      }
+      return false;
+    });
+    if (matches.length === 0) throw error;
+
+    for (const entry of matches) zip.deleteFile(entry);
+    deleted = matches.length;
+    await writeZipAtomically(zip, archivePath);
+  }
+
+  archiveMetaCache.delete(archivePath);
+  return { success: true, deleted };
+}
+
+/** Pick "name - Copy.ext" style names for same-folder pastes. */
+function copyNameFor(baseName, isDirectory) {
+  if (isDirectory) return `${baseName} - Copy`;
+  const ext = path.extname(baseName);
+  return `${baseName.slice(0, baseName.length - ext.length)} - Copy${ext}`;
+}
+
+/**
+ * Copy files/folders from any readable archive into a writable archive
+ * folder (the Ctrl+C / Ctrl+V flow). Content is extracted to a temp folder and
+ * added with the normal add-files path.
+ */
+async function copyEntriesToArchive({ sourceArchivePath, archivePath, roots, entries, targetDir }) {
+  if (!archivePath) throw new Error('No archive is open.');
+  const source = sourceArchivePath || archivePath;
+  await archiveInjectionKind(archivePath);
+  await ensureNestedWritable(archivePath);
+
+  const target = normalizeTargetDir(targetDir);
+  const rootNames = cleanEntryNames(roots);
+  let fileNames = cleanEntryNames(entries);
+  if (rootNames.length === 0) throw new Error('Nothing was copied.');
+  if (fileNames.length === 0) fileNames = rootNames;
+
+  const sameArchive = path.resolve(source) === path.resolve(archivePath);
+  if (sameArchive) {
+    for (const root of rootNames) {
+      if (target === root || target.startsWith(`${root}/`)) {
+        throw new Error('A folder cannot be pasted into itself.');
+      }
+    }
+  }
+
+  const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'openzip-copy-'));
+  try {
+    const extractDir = path.join(workDir, 'src');
+    await extractDragEntries(source, extractDir, fileNames);
+
+    const sources = [];
+    let counter = 0;
+    for (const root of rootNames) {
+      const absolute = safeDragPath(extractDir, root);
+      const stat = await fsp.stat(absolute).catch(() => null);
+      if (!stat) continue;
+
+      const parent = root.includes('/') ? root.slice(0, root.lastIndexOf('/')) : '';
+      if (sameArchive && parent === target) {
+        counter += 1;
+        const renamedDir = path.join(workDir, `rename-${counter}`);
+        await fsp.mkdir(renamedDir, { recursive: true });
+        const renamed = path.join(renamedDir, copyNameFor(path.basename(root), stat.isDirectory()));
+        await fsp.rename(absolute, renamed);
+        sources.push(renamed);
+      } else {
+        sources.push(absolute);
+      }
+    }
+    if (sources.length === 0) throw new Error('The copied items could not be read.');
+
+    return await addFilesToArchive({ archivePath, filePaths: sources, targetDir: target });
+  } finally {
+    await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 /** Turn a node-7z error into a message worth showing in the status bar. */
 function describeSevenError(error) {
@@ -3128,6 +3304,32 @@ ipcMain.handle('archive:readImage', async (_event, payload) => {
 ipcMain.handle('archive:addFiles', async (_event, payload) => {
   try {
     const result = await addFilesToArchive(payload || {});
+    if (result.success) {
+      invalidateDragSessions((payload || {}).archivePath);
+      invalidateNestedArchives((payload || {}).archivePath);
+    }
+    return result;
+  } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:deleteEntries', async (_event, payload) => {
+  try {
+    const result = await deleteEntriesFromArchive(payload || {});
+    if (result.success) {
+      invalidateDragSessions((payload || {}).archivePath);
+      invalidateNestedArchives((payload || {}).archivePath);
+    }
+    return result;
+  } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
+});
+
+ipcMain.handle('archive:copyEntries', async (_event, payload) => {
+  try {
+    const result = await copyEntriesToArchive(payload || {});
     if (result.success) {
       invalidateDragSessions((payload || {}).archivePath);
       invalidateNestedArchives((payload || {}).archivePath);
